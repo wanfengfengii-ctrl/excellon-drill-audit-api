@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    image: drillapi:latest
+    container_name: drillapi-api
+    environment:
+      # Port the process listens on inside the container.
+      API_PORT: "8080"
+    ports:
+      # Host-side port; override with API_PORT, e.g. API_PORT=9090 docker compose up.
+      - "${API_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # One-shot smoke test. Starts after the API is healthy, exercises the
+  # HTTP contract once, and exits 0 on success / 1 on failure.
+  verify:
+    image: drillapi:latest
+    build: .
+    container_name: drillapi-verify
+    entrypoint: ["/verify"]
+    environment:
+      API_URL: "http://api:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"

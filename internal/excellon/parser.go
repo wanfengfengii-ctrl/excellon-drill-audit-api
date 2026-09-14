@@ -1,0 +1,354 @@
+// Package excellon parses a restricted subset of Excellon drill files.
+//
+// Accepted grammar (one statement per line, no blank lines):
+//
+//	M48                       (line 1)
+//	METRIC                    (line 2)
+//	TnnC<diameter>            (one or more, header only)
+//	%                         (header terminator)
+//	Tnn                       (body only, selects a defined tool)
+//	X<coord>Y<coord>          (body only, exactly one X and one Y)
+//	M30                       (final line)
+//
+// Numbers are canonical decimals: an integer part of 0 or a positive
+// integer without leading zeros, optionally followed by one to three
+// fractional digits. A leading minus is allowed only for non-zero
+// coordinates (never for diameters).
+package excellon
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/shopspring/decimal"
+)
+
+// Error codes returned by Parse. They are stable API values.
+const (
+	CodeLineOrder     = "LINE_ORDER"
+	CodeInvalidNumber = "INVALID_NUMBER"
+	CodeDuplicateTool = "DUPLICATE_TOOL"
+	CodeUndefinedTool = "UNDEFINED_TOOL"
+	CodeNoHoles       = "NO_HOLES"
+)
+
+// ParseError identifies the first invalid line of a document.
+type ParseError struct {
+	Line int    // 1-based line number
+	Code string // one of the Code* constants
+}
+
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("line %d: %s", e.Line, e.Code)
+}
+
+// ToolCount reports how many holes were drilled with one tool.
+type ToolCount struct {
+	Tool  string `json:"tool"`
+	Holes int    `json:"holes"`
+}
+
+// Report is the statistics of a successfully parsed file.
+type Report struct {
+	Tools []ToolCount `json:"tools"`
+	Total int         `json:"total_holes"`
+	MinX  string      `json:"min_x"`
+	MinY  string      `json:"min_y"`
+	MaxX  string      `json:"max_x"`
+	MaxY  string      `json:"max_y"`
+}
+
+type phase int
+
+const (
+	phaseHeader phase = iota
+	phaseBody
+)
+
+// Parse validates the complete document and, only when every line is
+// valid and at least one hole exists, returns its statistics. The first
+// error encountered in textual order wins; within a line the order is
+// structural shape, number lexicon, then duplicate/undefined tool.
+func Parse(text string) (*Report, error) {
+	lines := splitLines(text)
+
+	diameters := make(map[string]decimal.Decimal)
+	var toolOrder []string
+	counts := make(map[string]int)
+	selected := ""
+	holeCount := 0
+
+	ph := phaseHeader
+	var minX, minY, maxX, maxY decimal.Decimal
+
+	for i, line := range lines {
+		lineNo := i + 1
+
+		if ph == phaseHeader {
+			switch {
+			case i == 0:
+				if line != "M48" {
+					return nil, &ParseError{lineNo, CodeLineOrder}
+				}
+			case i == 1:
+				if line != "METRIC" {
+					return nil, &ParseError{lineNo, CodeLineOrder}
+				}
+			case line == "%":
+				// The header requires one or more tool definitions.
+				if len(toolOrder) == 0 {
+					return nil, &ParseError{lineNo, CodeLineOrder}
+				}
+				ph = phaseBody
+			default:
+				tool, diam, ok := parseToolDef(line)
+				if !ok {
+					return nil, &ParseError{lineNo, CodeLineOrder}
+				}
+				// Structural shape matched: lexicon/range of the diameter
+				// wins over the duplicate-tool check.
+				if !isCanonicalNumber(diam, false, false) {
+					return nil, &ParseError{lineNo, CodeInvalidNumber}
+				}
+				if _, dup := diameters[tool]; dup {
+					return nil, &ParseError{lineNo, CodeDuplicateTool}
+				}
+				d, _ := decimal.NewFromString(diam)
+				diameters[tool] = d
+				toolOrder = append(toolOrder, tool)
+			}
+			continue
+		}
+
+		// Body.
+		if line == "M30" {
+			if lineNo != len(lines) {
+				return nil, &ParseError{lineNo, CodeLineOrder}
+			}
+			if holeCount == 0 {
+				return nil, &ParseError{lineNo, CodeNoHoles}
+			}
+			return buildReport(toolOrder, counts, holeCount, minX, minY, maxX, maxY), nil
+		}
+
+		if tool, ok := parseToolSelect(line); ok {
+			if _, defined := diameters[tool]; !defined {
+				return nil, &ParseError{lineNo, CodeUndefinedTool}
+			}
+			selected = tool
+			continue
+		}
+
+		xs, ys, ok := parseHole(line)
+		if !ok {
+			return nil, &ParseError{lineNo, CodeLineOrder}
+		}
+		// Both numbers share one lexicon check; the X axis is read first.
+		if !isCanonicalNumber(xs, true, true) || !isCanonicalNumber(ys, true, true) {
+			return nil, &ParseError{lineNo, CodeInvalidNumber}
+		}
+		if selected == "" {
+			return nil, &ParseError{lineNo, CodeUndefinedTool}
+		}
+		x, _ := decimal.NewFromString(xs)
+		y, _ := decimal.NewFromString(ys)
+		counts[selected]++
+		if holeCount == 0 {
+			minX, maxX, minY, maxY = x, x, y, y
+		} else {
+			if x.Cmp(minX) < 0 {
+				minX = x
+			}
+			if x.Cmp(maxX) > 0 {
+				maxX = x
+			}
+			if y.Cmp(minY) < 0 {
+				minY = y
+			}
+			if y.Cmp(maxY) > 0 {
+				maxY = y
+			}
+		}
+		holeCount++
+	}
+
+	// Ran out of lines before reaching M30 (includes an empty document).
+	return nil, &ParseError{len(lines) + 1, CodeLineOrder}
+}
+
+// splitLines splits on LF. A single trailing LF is treated as the line
+// terminator of the last line (standard text-file convention) rather
+// than an extra blank line; doubled trailing LFs or interior blank lines
+// still surface as invalid lines. CR is never stripped, so CRLF fails.
+func splitLines(text string) []string {
+	if text == "" {
+		return nil
+	}
+	if strings.HasSuffix(text, "\n") {
+		text = text[:len(text)-1]
+	}
+	if text == "" {
+		return nil
+	}
+	return strings.Split(text, "\n")
+}
+
+// parseToolDef matches TnnC<diameter>, nn in 01..99.
+func parseToolDef(line string) (tool, diam string, ok bool) {
+	if len(line) < 5 || line[0] != 'T' || line[3] != 'C' {
+		return "", "", false
+	}
+	tool = line[1:3]
+	if !isToolNumber(tool) {
+		return "", "", false
+	}
+	diam = line[4:]
+	if diam == "" {
+		return "", "", false
+	}
+	return tool, diam, true
+}
+
+// parseToolSelect matches a bare Tnn line, nn in 01..99.
+func parseToolSelect(line string) (string, bool) {
+	if len(line) != 3 || line[0] != 'T' {
+		return "", false
+	}
+	tool := line[1:3]
+	if !isToolNumber(tool) {
+		return "", false
+	}
+	return tool, true
+}
+
+// parseHole matches X<coord>Y<coord> with exactly one X and one Y axis,
+// in that order, each carrying a non-empty numeric word.
+func parseHole(line string) (x, y string, ok bool) {
+	if len(line) < 3 || line[0] != 'X' {
+		return "", "", false
+	}
+	i := 1
+	xStart := i
+	for i < len(line) && line[i] != 'Y' {
+		if line[i] == 'X' {
+			return "", "", false
+		}
+		i++
+	}
+	if i == len(line) || i == xStart {
+		return "", "", false
+	}
+	x = line[xStart:i]
+	i++ // consume Y
+	yStart := i
+	if yStart >= len(line) {
+		return "", "", false
+	}
+	rest := line[yStart:]
+	if strings.ContainsRune(rest, 'X') || strings.ContainsRune(rest, 'Y') {
+		return "", "", false
+	}
+	return x, rest, true
+}
+
+func isToolNumber(s string) bool {
+	return len(s) == 2 && s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9' && s != "00"
+}
+
+// isCanonicalNumber checks the canonical decimal contract:
+// optional minus, then "0" or a no-leading-zero positive integer,
+// then an optional 1..3 digit fraction. A minus is only accepted when
+// allowNegative is set and the magnitude is non-zero; a zero magnitude
+// is only accepted when allowZero is set (tool diameters must be > 0).
+func isCanonicalNumber(s string, allowNegative, allowZero bool) bool {
+	if s == "" {
+		return false
+	}
+	neg := false
+	if s[0] == '-' {
+		if !allowNegative {
+			return false
+		}
+		neg = true
+		s = s[1:]
+	}
+	if s == "" {
+		return false
+	}
+
+	intPart := s
+	fracPart := ""
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		intPart = s[:dot]
+		fracPart = s[dot+1:]
+		if len(fracPart) < 1 || len(fracPart) > 3 {
+			return false
+		}
+		for _, c := range fracPart {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+
+	switch {
+	case len(intPart) == 1 && intPart[0] == '0':
+	case len(intPart) >= 1 && intPart[0] >= '1' && intPart[0] <= '9':
+		for i := 1; i < len(intPart); i++ {
+			if intPart[i] < '0' || intPart[i] > '9' {
+				return false
+			}
+		}
+	default:
+		return false
+	}
+
+	if isZeroMagnitude(intPart, fracPart) {
+		// Diameters must be strictly positive; negative zero is
+		// never a well-formed number.
+		if !allowZero || neg {
+			return false
+		}
+	}
+	return true
+}
+
+func isZeroMagnitude(intPart, fracPart string) bool {
+	if intPart != "0" {
+		return false
+	}
+	for i := 0; i < len(fracPart); i++ {
+		if fracPart[i] != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func buildReport(
+	toolOrder []string,
+	counts map[string]int,
+	holeCount int,
+	minX, minY, maxX, maxY decimal.Decimal,
+) *Report {
+	tools := make([]ToolCount, 0, len(toolOrder))
+	for _, t := range toolOrder {
+		if n := counts[t]; n > 0 {
+			tools = append(tools, ToolCount{Tool: "T" + t, Holes: n})
+		}
+	}
+	return &Report{
+		Tools: tools,
+		Total: holeCount,
+		MinX:  formatDecimal(minX),
+		MinY:  formatDecimal(minY),
+		MaxX:  formatDecimal(maxX),
+		MaxY:  formatDecimal(maxY),
+	}
+}
+
+// formatDecimal renders exactly three fractional digits without
+// scientific notation, preserving the sign of negative coordinates.
+func formatDecimal(d decimal.Decimal) string {
+	return d.StringFixed(3)
+}
