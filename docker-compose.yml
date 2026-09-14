@@ -1,5 +1,10 @@
 services:
   api:
+    # Only the api service declares the build, so the image is built once.
+    # The verify service reuses this exact local image (different
+    # entrypoint); declaring `build` on both made Compose export the two
+    # concurrent builds into the same tag, which raced and could leave the
+    # verify container without a usable image.
     build: .
     image: drillapi:latest
     container_name: drillapi-api
@@ -12,10 +17,12 @@ services:
     restart: unless-stopped
 
   # One-shot smoke test. Starts after the API is healthy, exercises the
-  # HTTP contract once, and exits 0 on success / 1 on failure.
+  # HTTP contract once, and exits 0 on success / 1 on failure. It reuses
+  # the image built by `api` instead of building it again.
   verify:
     image: drillapi:latest
-    build: .
+    # Never pull: the tag is produced locally by the api service's build.
+    pull_policy: never
     container_name: drillapi-verify
     entrypoint: ["/verify"]
     environment:

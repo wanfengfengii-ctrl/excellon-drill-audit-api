@@ -142,5 +142,9 @@ docker compose logs verify          # 查看一次性检查结果（通过后退
 - `verify` 服务：等待 `api` 健康后启动，跑一组成功/失败用例（成功体、三类 422、
   最早错误、415 等），输出 `verify: all checks passed` 后退出；任一断言失败则退出码非 0
 
+镜像只由 `api` 服务声明一次构建；`verify` 复用同一个本地镜像（换用 `/verify`
+入口，`pull_policy: never`），避免两个服务并行构建并争用 `drillapi:latest`
+同名标签。若只想跑验收，先构建再启动即可：`docker compose build api && docker compose up verify`。
+
 镜像为多阶段构建：`golang:1.25-bookworm` 编译三个静态二进制，运行时为
 `gcr.io/distroless/static-debian12`（非 root 用户，无 shell）。
