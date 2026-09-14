@@ -14,6 +14,9 @@
 // integer without leading zeros, optionally followed by one to three
 // fractional digits. A leading minus is allowed only for non-zero
 // coordinates (never for diameters).
+//
+// ParseWithClearance optionally audits the minimum edge-to-edge spacing
+// between every pair of drilled holes; Parse skips that audit.
 package excellon
 
 import (
@@ -30,15 +33,22 @@ const (
 	CodeDuplicateTool = "DUPLICATE_TOOL"
 	CodeUndefinedTool = "UNDEFINED_TOOL"
 	CodeNoHoles       = "NO_HOLES"
+	CodeHoleClearance = "HOLE_CLEARANCE"
 )
 
 // ParseError identifies the first invalid line of a document.
 type ParseError struct {
 	Line int    // 1-based line number
 	Code string // one of the Code* constants
+	// ConflictLine is set only for CodeHoleClearance: the 1-based line of
+	// the earlier hole whose clearance zone the hole at Line violates.
+	ConflictLine int
 }
 
 func (e *ParseError) Error() string {
+	if e.Code == CodeHoleClearance {
+		return fmt.Sprintf("line %d: %s (conflicts with line %d)", e.Line, e.Code, e.ConflictLine)
+	}
 	return fmt.Sprintf("line %d: %s", e.Line, e.Code)
 }
 
@@ -70,6 +80,20 @@ const (
 // error encountered in textual order wins; within a line the order is
 // structural shape, number lexicon, then duplicate/undefined tool.
 func Parse(text string) (*Report, error) {
+	return ParseWithClearance(text, nil)
+}
+
+// ParseWithClearance behaves like Parse and, when minClearance is
+// non-nil, additionally audits hole-to-hole spacing: every validated
+// hole's center must be at least (own radius + earlier radius +
+// minClearance) away from every previously validated hole, compared in
+// body line order. The audit runs only after the line's structure,
+// number lexicon and tool reference have all passed, so every
+// pre-existing error keeps its priority; the first conflicting pair
+// aborts the parse with CodeHoleClearance, reporting the current line
+// and the earlier ConflictLine. A nil minClearance disables the audit
+// entirely.
+func ParseWithClearance(text string, minClearance *decimal.Decimal) (*Report, error) {
 	lines := splitLines(text)
 
 	diameters := make(map[string]decimal.Decimal)
@@ -77,6 +101,9 @@ func Parse(text string) (*Report, error) {
 	counts := make(map[string]int)
 	selected := ""
 	holeCount := 0
+	// Validated hole positions in body line order; only populated while
+	// the clearance audit is active.
+	var holes []placedHole
 
 	ph := phaseHeader
 	var minX, minY, maxX, maxY decimal.Decimal
@@ -88,30 +115,30 @@ func Parse(text string) (*Report, error) {
 			switch {
 			case i == 0:
 				if line != "M48" {
-					return nil, &ParseError{lineNo, CodeLineOrder}
+					return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 				}
 			case i == 1:
 				if line != "METRIC" {
-					return nil, &ParseError{lineNo, CodeLineOrder}
+					return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 				}
 			case line == "%":
 				// The header requires one or more tool definitions.
 				if len(toolOrder) == 0 {
-					return nil, &ParseError{lineNo, CodeLineOrder}
+					return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 				}
 				ph = phaseBody
 			default:
 				tool, diam, ok := parseToolDef(line)
 				if !ok {
-					return nil, &ParseError{lineNo, CodeLineOrder}
+					return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 				}
 				// Structural shape matched: lexicon/range of the diameter
 				// wins over the duplicate-tool check.
 				if !isCanonicalNumber(diam, false, false) {
-					return nil, &ParseError{lineNo, CodeInvalidNumber}
+					return nil, &ParseError{Line: lineNo, Code: CodeInvalidNumber}
 				}
 				if _, dup := diameters[tool]; dup {
-					return nil, &ParseError{lineNo, CodeDuplicateTool}
+					return nil, &ParseError{Line: lineNo, Code: CodeDuplicateTool}
 				}
 				d, _ := decimal.NewFromString(diam)
 				diameters[tool] = d
@@ -123,17 +150,17 @@ func Parse(text string) (*Report, error) {
 		// Body.
 		if line == "M30" {
 			if lineNo != len(lines) {
-				return nil, &ParseError{lineNo, CodeLineOrder}
+				return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 			}
 			if holeCount == 0 {
-				return nil, &ParseError{lineNo, CodeNoHoles}
+				return nil, &ParseError{Line: lineNo, Code: CodeNoHoles}
 			}
 			return buildReport(toolOrder, counts, holeCount, minX, minY, maxX, maxY), nil
 		}
 
 		if tool, ok := parseToolSelect(line); ok {
 			if _, defined := diameters[tool]; !defined {
-				return nil, &ParseError{lineNo, CodeUndefinedTool}
+				return nil, &ParseError{Line: lineNo, Code: CodeUndefinedTool}
 			}
 			selected = tool
 			continue
@@ -141,17 +168,34 @@ func Parse(text string) (*Report, error) {
 
 		xs, ys, ok := parseHole(line)
 		if !ok {
-			return nil, &ParseError{lineNo, CodeLineOrder}
+			return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 		}
 		// Both numbers share one lexicon check; the X axis is read first.
 		if !isCanonicalNumber(xs, true, true) || !isCanonicalNumber(ys, true, true) {
-			return nil, &ParseError{lineNo, CodeInvalidNumber}
+			return nil, &ParseError{Line: lineNo, Code: CodeInvalidNumber}
 		}
 		if selected == "" {
-			return nil, &ParseError{lineNo, CodeUndefinedTool}
+			return nil, &ParseError{Line: lineNo, Code: CodeUndefinedTool}
 		}
 		x, _ := decimal.NewFromString(xs)
 		y, _ := decimal.NewFromString(ys)
+		if minClearance != nil {
+			radius := diameters[selected].Div(two)
+			for _, h := range holes {
+				// Squared comparison only: conflict iff
+				//   dx² + dy² < (r₁ + r₂ + minClearance)²
+				// Exact decimal arithmetic (halving a diameter is exact
+				// in decimal) avoids square roots and rounding error;
+				// equality — exactly tangent holes — passes.
+				need := h.radius.Add(radius).Add(*minClearance)
+				dx := x.Sub(h.x)
+				dy := y.Sub(h.y)
+				if dx.Mul(dx).Add(dy.Mul(dy)).Cmp(need.Mul(need)) < 0 {
+					return nil, &ParseError{Line: lineNo, Code: CodeHoleClearance, ConflictLine: h.line}
+				}
+			}
+			holes = append(holes, placedHole{line: lineNo, x: x, y: y, radius: radius})
+		}
 		counts[selected]++
 		if holeCount == 0 {
 			minX, maxX, minY, maxY = x, x, y, y
@@ -173,7 +217,30 @@ func Parse(text string) (*Report, error) {
 	}
 
 	// Ran out of lines before reaching M30 (includes an empty document).
-	return nil, &ParseError{len(lines) + 1, CodeLineOrder}
+	return nil, &ParseError{Line: len(lines) + 1, Code: CodeLineOrder}
+}
+
+// placedHole is a validated hole position kept, in body line order, for
+// the clearance audit.
+type placedHole struct {
+	line   int
+	x, y   decimal.Decimal
+	radius decimal.Decimal
+}
+
+// two is the exact divisor turning a tool diameter into its radius.
+var two = decimal.NewFromInt(2)
+
+// ParseClearance validates a min_clearance query value against the same
+// canonical decimal contract used inside drill files — no sign, zero
+// allowed (the clearance only has to be >= 0) — and returns its exact
+// decimal value.
+func ParseClearance(s string) (decimal.Decimal, bool) {
+	if !isCanonicalNumber(s, false, true) {
+		return decimal.Decimal{}, false
+	}
+	d, _ := decimal.NewFromString(s)
+	return d, true
 }
 
 // splitLines splits on LF. A single trailing LF is treated as the line

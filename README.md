@@ -33,6 +33,11 @@
 提交一份钻孔程序文本并返回统计结果。
 
 - 请求：`Content-Type: text/plain`（允许 `text/plain; charset=utf-8` 等参数），请求体为 UTF-8 纯文本
+- 可选查询参数 `min_clearance`：规范十进制且 ≥ 0（同文件内数值写法，不允许负号）。传入后启用
+  **孔边最小间距审计**：任意两孔的中心距必须 ≥ 两孔半径之和 + `min_clearance`，否则整份文件拒绝；
+  恰好相切（等于）视为通过。比较全程使用距离平方与精确十进制运算，无开方、无浮点误差。
+  参数非法（如 `-1`、`1.1234`、`01`）直接返回 `400 INVALID_CLEARANCE`，不进入文件解析；
+  未传参时行为与响应与之前完全一致
 - 成功：`200 OK`，JSON 响应
 - 文件内容不合法：`422 Unprocessable Entity`，JSON 错误体
 - 非 `text/plain`：`415 Unsupported Media Type`
@@ -63,6 +68,12 @@
 { "code": "UNDEFINED_TOOL", "line": 5 }
 ```
 
+间距冲突的错误体会额外携带 `conflict_line`（与当前行孔位冲突的较早孔所在行）：
+
+```json
+{ "code": "HOLE_CLEARANCE", "line": 7, "conflict_line": 6 }
+```
+
 | code | 含义 |
 |---|---|
 | `LINE_ORDER` | 结构/指令错误：行序不对、出现不允许的指令、空行、缺行、CRLF、多余坐标轴等 |
@@ -70,6 +81,10 @@
 | `DUPLICATE_TOOL` | 头部重复定义同一刀号 |
 | `UNDEFINED_TOOL` | 正文选择了头部未定义的刀具（或未选刀就钻孔） |
 | `NO_HOLES` | 文件结构完整但正文没有任何钻孔记录 |
+| `HOLE_CLEARANCE` | 仅在传入 `min_clearance` 时出现：当前行孔位与 `conflict_line` 的较早孔位间距不足 |
+
+间距审计只在行结构、数值词法、刀具引用全部合法之后执行，既有错误优先级不变；
+`min_clearance` 参数本身的非法值返回 `400 INVALID_CLEARANCE`（客户端错误），不会被当作文件错误。
 
 ### `GET /healthz`
 
@@ -107,6 +122,9 @@ M30                 # 最后一行必须是 M30
    - 例如未选刀就遇到 `X01Y1`：`01` 词法非法（`INVALID_NUMBER`）优先于未选刀（`UNDEFINED_TOOL`）
 3. `M30` 不是最后一行时，错误定位在该 `M30` 行；文件在 `M30` 前结束时定位在“缺失的下一行”。
 4. 无任何钻孔记录时，在 `M30` 所在行报 `NO_HOLES`。
+5. 启用 `min_clearance` 审计时，间距检查排在同一行的结构、数值、刀具引用检查**之后**；
+   每个通过校验的孔按正文行序与此前所有孔比较，首次冲突即在当前行报 `HOLE_CLEARANCE`
+   并给出冲突的较早行 `conflict_line`。
 
 ## 本地开发
 
@@ -140,7 +158,8 @@ docker compose logs verify          # 查看一次性检查结果（通过后退
 
 - `api` 服务：常驻，内置容器健康检查（自带 `/healthcheck` 探针，适配 distroless）
 - `verify` 服务：等待 `api` 健康后启动，跑一组成功/失败用例（成功体、三类 422、
-  最早错误、415 等），输出 `verify: all checks passed` 后退出；任一断言失败则退出码非 0
+  最早错误、415、`min_clearance` 合法/相切/冲突/非法参数等），输出
+  `verify: all checks passed` 后退出；任一断言失败则退出码非 0
 
 镜像只由 `api` 服务声明一次构建；`verify` 复用同一个本地镜像（换用 `/verify`
 入口，`pull_policy: never`），避免两个服务并行构建并争用 `drillapi:latest`

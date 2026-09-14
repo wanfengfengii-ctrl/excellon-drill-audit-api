@@ -3,6 +3,7 @@ package excellon_test
 import (
 	"testing"
 
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -208,4 +209,175 @@ func TestParse_CanonicalNumberBoundaries(t *testing.T) {
 func TestParseError_Message(t *testing.T) {
 	e := &excellon.ParseError{Line: 7, Code: excellon.CodeUndefinedTool}
 	assert.Equal(t, "line 7: UNDEFINED_TOOL", e.Error())
+}
+
+func TestParseError_ClearanceMessage(t *testing.T) {
+	e := &excellon.ParseError{Line: 9, Code: excellon.CodeHoleClearance, ConflictLine: 7}
+	assert.Equal(t, "line 9: HOLE_CLEARANCE (conflicts with line 7)", e.Error())
+}
+
+// dec is a test helper turning a canonical string into a *decimal.Decimal.
+func dec(s string) *decimal.Decimal {
+	d, err := decimal.NewFromString(s)
+	if err != nil {
+		panic(err)
+	}
+	return &d
+}
+
+func TestParseWithClearance_NilDisablesAudit(t *testing.T) {
+	// Two holes at the exact same spot: legal without the audit.
+	in := "M48\nMETRIC\nT01C1.000\n%\nT01\nX1Y1\nX1Y1\nM30\n"
+	r, err := excellon.Parse(in)
+	require.NoError(t, err)
+	assert.Equal(t, 2, r.Total)
+
+	// The same file fails as soon as the audit is requested, even with
+	// a zero clearance (distance 0 < r + r).
+	_, err = excellon.ParseWithClearance(in, dec("0"))
+	require.Error(t, err)
+	pe := err.(*excellon.ParseError)
+	assert.Equal(t, excellon.CodeHoleClearance, pe.Code)
+	assert.Equal(t, 7, pe.Line)
+	assert.Equal(t, 6, pe.ConflictLine)
+}
+
+func TestParseWithClearance_ValidSpacingKeepsStatistics(t *testing.T) {
+	want, err := excellon.Parse(validFile)
+	require.NoError(t, err)
+
+	got, err := excellon.ParseWithClearance(validFile, dec("0.5"))
+	require.NoError(t, err)
+	// The audit must not alter the statistics of a passing file.
+	assert.Equal(t, want, got)
+}
+
+func TestParseWithClearance_TangencyPasses(t *testing.T) {
+	cases := []struct {
+		name      string
+		clearance string
+		in        string
+	}{
+		// dist == r + r with zero clearance.
+		{"zero clearance tangent", "0",
+			"M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX1Y0\nM30\n"},
+		// dist == r + r + clearance.
+		{"tangent with clearance", "0.5",
+			"M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX1.500Y0\nM30\n"},
+		// 3-4-5 triangle: dist 5 == 1 + 2 + 2 (diameters 2 and 4).
+		{"pythagorean tangency", "2",
+			"M48\nMETRIC\nT01C2.000\nT02C4.000\n%\nT01\nX0Y0\nT02\nX3Y4\nM30\n"},
+		// Fractional radii: d = 0.3 -> r = 0.15; dist 0.3 == 0.15 + 0.15.
+		// Exact decimal halving keeps this a pass where floats would not.
+		{"fractional radius tangency", "0",
+			"M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nX0.300Y0\nM30\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := excellon.ParseWithClearance(tc.in, dec(tc.clearance))
+			require.NoError(t, err)
+			require.NotNil(t, r)
+		})
+	}
+}
+
+func TestParseWithClearance_ConflictLocatesBothLines(t *testing.T) {
+	// Lines 6/7/8 drill at x = 0, 2, 1 with r = 0.5 and clearance 0.5
+	// (need = 1.5). Line 8 is 1.0 away from both earlier holes; the
+	// earliest conflicting line (6) must be reported.
+	in := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX2Y0\nX1Y0\nM30\n"
+	_, err := excellon.ParseWithClearance(in, dec("0.5"))
+	require.Error(t, err)
+	pe := err.(*excellon.ParseError)
+	assert.Equal(t, excellon.CodeHoleClearance, pe.Code)
+	assert.Equal(t, 8, pe.Line)
+	assert.Equal(t, 6, pe.ConflictLine)
+}
+
+func TestParseWithClearance_FirstConflictWins(t *testing.T) {
+	// Two independent conflicting pairs: (6,7) and (8,9). The pair
+	// completed first in textual order (line 7) is reported.
+	in := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX0.5Y0\nX10Y0\nX10.5Y0\nM30\n"
+	_, err := excellon.ParseWithClearance(in, dec("0.5"))
+	require.Error(t, err)
+	pe := err.(*excellon.ParseError)
+	assert.Equal(t, 7, pe.Line)
+	assert.Equal(t, 6, pe.ConflictLine)
+}
+
+func TestParseWithClearance_UsesSelectedToolRadius(t *testing.T) {
+	// T01 r = 0.25, T02 r = 1.0; centers 1.3 apart (lines 7 and 9).
+	in := "M48\nMETRIC\nT01C0.500\nT02C2.000\n%\nT01\nX0Y0\nT02\nX1.300Y0\nM30\n"
+
+	// need = 0.25 + 1.0 + 0.05 = 1.30 == dist: tangent, passes.
+	_, err := excellon.ParseWithClearance(in, dec("0.05"))
+	require.NoError(t, err)
+
+	// need = 1.301 > 1.3: conflict.
+	_, err = excellon.ParseWithClearance(in, dec("0.051"))
+	require.Error(t, err)
+	pe := err.(*excellon.ParseError)
+	assert.Equal(t, excellon.CodeHoleClearance, pe.Code)
+	assert.Equal(t, 9, pe.Line)
+	assert.Equal(t, 7, pe.ConflictLine)
+}
+
+func TestParseWithClearance_ExistingErrorsKeepPriority(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		line int
+		code string
+	}{
+		// INVALID_NUMBER on line 6: line 7 never gets audited.
+		{"earlier invalid number",
+			"M48\nMETRIC\nT01C1.000\n%\nT01\nX01Y0\nX0Y0\nM30\n",
+			6, excellon.CodeInvalidNumber},
+		// Same line: the hole's own bad number beats its clearance conflict.
+		{"same line invalid number beats clearance",
+			"M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX0.0.1Y0\nM30\n",
+			7, excellon.CodeInvalidNumber},
+		// Structure error on line 5 precedes any hole pair.
+		{"earlier structure error",
+			"M48\nMETRIC\nT01C1.000\n%\nBOGUS\nT01\nX0Y0\nX0Y0\nM30\n",
+			5, excellon.CodeLineOrder},
+		// Undefined tool reference precedes any hole pair.
+		{"earlier undefined tool",
+			"M48\nMETRIC\nT01C1.000\n%\nT02\nX0Y0\nX0Y0\nM30\n",
+			5, excellon.CodeUndefinedTool},
+		// NO_HOLES is still reported when the audit is active.
+		{"no holes still reported",
+			"M48\nMETRIC\nT01C1.000\n%\nT01\nM30\n",
+			6, excellon.CodeNoHoles},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := excellon.ParseWithClearance(tc.in, dec("0.5"))
+			require.Error(t, err)
+			pe := err.(*excellon.ParseError)
+			assert.Equal(t, tc.code, pe.Code)
+			assert.Equal(t, tc.line, pe.Line)
+			assert.Equal(t, 0, pe.ConflictLine)
+		})
+	}
+}
+
+func TestParseClearance(t *testing.T) {
+	valid := []string{"0", "0.0", "0.000", "1", "1.5", "12.345", "1000"}
+	for _, s := range valid {
+		t.Run("valid/"+s, func(t *testing.T) {
+			d, ok := excellon.ParseClearance(s)
+			require.True(t, ok)
+			want, _ := decimal.NewFromString(s)
+			assert.True(t, want.Equal(d), "value mismatch for %q", s)
+		})
+	}
+
+	invalid := []string{"", "-0", "-0.0", "-1", "-1.5", "01", "00", "1.", ".5", "1.1234", "+1", "1e3", "abc", " 1", "1 ", "1,5"}
+	for _, s := range invalid {
+		t.Run("invalid/"+s, func(t *testing.T) {
+			_, ok := excellon.ParseClearance(s)
+			assert.False(t, ok)
+		})
+	}
 }

@@ -95,6 +95,39 @@ func main() {
 	resp, body = post(client, base+"/drill-files/statistics", "application/json", valid)
 	a.Equal(http.StatusUnsupportedMediaType, resp.StatusCode, "JSON body must return 415: %s", body)
 
+	// 8. min_clearance satisfied: the statistics are identical to the
+	//    no-parameter response.
+	resp, body = post(client, base+"/drill-files/statistics?min_clearance=0.5", "text/plain", valid)
+	a.Equal(http.StatusOK, resp.StatusCode, "valid clearance must return 200: %s", body)
+	var cleared map[string]any
+	_ = json.Unmarshal(body, &cleared)
+	a.EqualValues(float64(3), cleared["total_holes"])
+	a.Equal("-0.500", cleared["min_x"])
+	a.Equal("2.000", cleared["max_y"])
+
+	// 9. Critical tangency passes: distance == r + r + clearance.
+	tangent := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX1.500Y0\nM30\n"
+	resp, body = post(client, base+"/drill-files/statistics?min_clearance=0.5", "text/plain", tangent)
+	a.Equal(http.StatusOK, resp.StatusCode, "tangent holes must pass: %s", body)
+
+	// 10. Clearance conflict: 422 HOLE_CLEARANCE locating both lines.
+	conflict := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX1Y0\nM30\n"
+	resp, body = post(client, base+"/drill-files/statistics?min_clearance=0.5", "text/plain", conflict)
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "conflict must return 422: %s", body)
+	var cerr map[string]any
+	_ = json.Unmarshal(body, &cerr)
+	a.Equal("HOLE_CLEARANCE", cerr["code"], "body: %s", body)
+	a.EqualValues(float64(7), cerr["line"], "body: %s", body)
+	a.EqualValues(float64(6), cerr["conflict_line"], "body: %s", body)
+
+	// 11. Invalid min_clearance is a 400 client error and is never
+	//     masked as a file error, even when the body itself is invalid.
+	resp, body = post(client, base+"/drill-files/statistics?min_clearance=-1", "text/plain", "GARBAGE\n")
+	a.Equal(http.StatusBadRequest, resp.StatusCode, "invalid clearance must return 400: %s", body)
+	var badParam map[string]any
+	_ = json.Unmarshal(body, &badParam)
+	a.Equal("INVALID_CLEARANCE", badParam["code"], "body: %s", body)
+
 	if t.failed {
 		os.Exit(1)
 	}

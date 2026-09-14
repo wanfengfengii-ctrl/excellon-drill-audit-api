@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 
 	"drillapi/internal/excellon"
 )
@@ -18,6 +19,9 @@ const maxBodyBytes = 10 << 20
 type ErrorBody struct {
 	Code string `json:"code"`
 	Line int    `json:"line,omitempty"`
+	// ConflictLine is set only for HOLE_CLEARANCE: the earlier hole the
+	// hole at Line collides with.
+	ConflictLine int `json:"conflict_line,omitempty"`
 }
 
 // Router builds the application's HTTP handler.
@@ -41,6 +45,19 @@ func postStatistics(c *gin.Context) {
 		return
 	}
 
+	// Optional min_clearance audit parameter: a canonical decimal >= 0.
+	// An invalid value is a client error, never a file error, so it is
+	// rejected before the request body is even read.
+	var clearance *decimal.Decimal
+	if raw, present := c.GetQuery("min_clearance"); present {
+		d, ok := excellon.ParseClearance(raw)
+		if !ok {
+			c.JSON(http.StatusBadRequest, ErrorBody{Code: "INVALID_CLEARANCE"})
+			return
+		}
+		clearance = &d
+	}
+
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBodyBytes+1))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, ErrorBody{Code: "BAD_REQUEST"})
@@ -51,10 +68,10 @@ func postStatistics(c *gin.Context) {
 		return
 	}
 
-	report, err := excellon.Parse(string(body))
+	report, err := excellon.ParseWithClearance(string(body), clearance)
 	if err != nil {
 		pe := err.(*excellon.ParseError)
-		c.JSON(http.StatusUnprocessableEntity, ErrorBody{Code: pe.Code, Line: pe.Line})
+		c.JSON(http.StatusUnprocessableEntity, ErrorBody{Code: pe.Code, Line: pe.Line, ConflictLine: pe.ConflictLine})
 		return
 	}
 	c.JSON(http.StatusOK, report)
