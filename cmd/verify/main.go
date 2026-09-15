@@ -174,15 +174,25 @@ func main() {
 	a.EqualValues(float64(10), asym["line"], "body: %s", body)
 	a.Equal([]any{float64(10)}, asym["uncovered_lines"], "body: %s", body)
 
-	// 14. A lone hole exactly at the center cannot self-match under a
-	//     half-turn, so self-mapping holes must conserve an even count.
+	// 14. A lone hole exactly at the center is a fixed point of the
+	//     half-turn and therefore symmetric on its own; it must pass.
 	selfMap := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nM30\n"
 	resp, body = post(client, base+"/drill-files/statistics?symmetry_center=0,0", "text/plain", selfMap)
-	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "lone center hole must return 422: %s", body)
-	var selfAsym map[string]any
-	_ = json.Unmarshal(body, &selfAsym)
-	a.Equal("ASYMMETRIC_PATTERN", selfAsym["code"], "body: %s", body)
-	a.EqualValues(float64(6), selfAsym["line"], "body: %s", body)
+	a.Equal(http.StatusOK, resp.StatusCode, "center fixed point must return 200: %s", body)
+	var fixed map[string]any
+	_ = json.Unmarshal(body, &fixed)
+	a.EqualValues(float64(1), fixed["total_holes"], "body: %s", body)
+
+	// 14b. The fixed point never supplies a partner: adding a lone
+	//      off-center hole still fails and reports only that source line.
+	plusUnbalanced := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nX1Y0\nM30\n"
+	resp, body = post(client, base+"/drill-files/statistics?symmetry_center=0,0", "text/plain", plusUnbalanced)
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "unbalanced off-center hole must return 422: %s", body)
+	var plusAsym map[string]any
+	_ = json.Unmarshal(body, &plusAsym)
+	a.Equal("ASYMMETRIC_PATTERN", plusAsym["code"], "body: %s", body)
+	a.EqualValues(float64(7), plusAsym["line"], "body: %s", body)
+	a.Equal([]any{float64(7)}, plusAsym["uncovered_lines"], "body: %s", body)
 
 	// 15. Audit priority: a file error is reported before the symmetry
 	//     audit even runs.
@@ -191,11 +201,12 @@ func main() {
 	expect422(a, resp, body, "UNDEFINED_TOOL", 5)
 
 	// 16. Audit priority: a clearance conflict aborts before the
-	//     symmetry audit (coincident center holes fail both; the
-	//     clearance pair on lines 6/7 wins).
+	//     symmetry audit. Two coincident holes off-center at (1,0) fail
+	//     the spacing audit (lines 6/7) and are also unbalanced under
+	//     the half-turn about the origin; the clearance result wins.
 	resp, body = post(client,
 		base+"/drill-files/statistics?min_clearance=0.5&symmetry_center=0,0",
-		"text/plain", "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX0Y0\nM30\n")
+		"text/plain", "M48\nMETRIC\nT01C1.000\n%\nT01\nX1Y0\nX1Y0\nM30\n")
 	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "clearance must precede symmetry: %s", body)
 	var clearFirst map[string]any
 	_ = json.Unmarshal(body, &clearFirst)

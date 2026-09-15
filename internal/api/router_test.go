@@ -206,20 +206,26 @@ func TestStatistics_SymmetryCenterNonOrigin(t *testing.T) {
 }
 
 func TestStatistics_SelfMappingCenterHoles(t *testing.T) {
-	// Two holes exactly at the center pair with each other; a lone
-	// center hole cannot self-match.
-	pair := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nX0Y0\nX1Y0\nX-1Y0\nM30\n"
-	w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", pair)
+	// A hole exactly at the center is a half-turn fixed point and
+	// covers itself; one or many center holes pass without a partner.
+	lone := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nM30\n"
+	w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", lone)
 	require.Equal(t, http.StatusOK, w.Code, string(raw))
 
-	lone := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nM30\n"
-	w, raw = postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", lone)
+	many := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nX0Y0\nX0Y0\nX1Y0\nX-1Y0\nM30\n"
+	w, raw = postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", many)
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+
+	// But a fixed point never supplies a partner: the lone off-center
+	// hole on line 7 stays uncovered.
+	plusOne := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nX1Y0\nM30\n"
+	w, raw = postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", plusOne)
 	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(raw, &got))
 	assert.Equal(t, "ASYMMETRIC_PATTERN", got["code"])
-	assert.EqualValues(t, 6, got["line"])
-	assert.Equal(t, []any{float64(6)}, got["uncovered_lines"])
+	assert.EqualValues(t, 7, got["line"])
+	assert.Equal(t, []any{float64(7)}, got["uncovered_lines"])
 	assert.NotContains(t, string(raw), "total_holes")
 }
 
@@ -311,9 +317,10 @@ func TestStatistics_FileErrorBeatsSymmetryAudit(t *testing.T) {
 }
 
 func TestStatistics_ClearanceBeatsSymmetryAudit(t *testing.T) {
-	// Coincident center holes: the clearance audit fails first (line 7
-	// vs line 6); the odd self-mapping count never surfaces.
-	body := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX0Y0\nM30\n"
+	// Two coincident holes off-center at (1,0): the clearance audit
+	// fails (line 7 vs line 6) and the holes are also unbalanced under
+	// the half-turn about (0,0); the clearance result must win.
+	body := "M48\nMETRIC\nT01C1.000\n%\nT01\nX1Y0\nX1Y0\nM30\n"
 	path := "/drill-files/statistics?min_clearance=0.5&symmetry_center=0,0"
 	w, raw := postPath(t, api.Router(), path, "text/plain", body)
 	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))

@@ -458,9 +458,23 @@ func TestParseWithAudits_ExactHalfTurnSymmetry(t *testing.T) {
 			center("0", "0"),
 		},
 		{
-			"self-mapping center holes conserved in pairs",
-			// Holes exactly at the center pair with each other; other
-			// holes pair normally.
+			"a single hole at the center is a fixed point",
+			// One hole exactly at the center rotates onto itself, so
+			// count conservation holds with no partner required.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nM30\n",
+			center("0", "0"),
+		},
+		{
+			"center fixed points pass at any multiplicity",
+			// Three coincident center holes are all fixed points; the
+			// extra off-center pair is balanced as usual.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nX0Y0\nX0Y0\nX1Y0\nX-1Y0\nM30\n",
+			center("0", "0"),
+		},
+		{
+			"a fixed-point center hole never supplies a partner",
+			// A center hole coexists with a balanced pair; it covers
+			// itself and must not be consumed as anyone's partner.
 			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nX0Y0\nX1Y0\nX-1Y0\nM30\n",
 			center("0", "0"),
 		},
@@ -498,17 +512,20 @@ func TestParseWithAudits_AsymmetricPatterns(t *testing.T) {
 		uncovered []int
 	}{
 		{
-			"single self-mapping center hole cannot pair with itself",
-			// Line 6 is the only hole and sits exactly on the center.
-			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nM30\n",
+			"center fixed point does not cover an unbalanced off-center hole",
+			// Line 6 sits at the center and passes on its own; the lone
+			// (1,0) on line 7 still has no partner at (-1,0).
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nX1Y0\nM30\n",
 			center("0", "0"),
-			[]int{6},
+			[]int{7},
 		},
 		{
-			"three center holes leave one uncovered",
-			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nX0Y0\nX0Y0\nM30\n",
+			"three center fixed points plus one unbalanced hole",
+			// Lines 6-8 are center fixed points; the lone (1,0) on
+			// line 9 is the only uncovered source.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nX0Y0\nX0Y0\nX1Y0\nM30\n",
 			center("0", "0"),
-			[]int{8},
+			[]int{9},
 		},
 		{
 			"missing rotated partner",
@@ -549,11 +566,13 @@ func TestParseWithAudits_AsymmetricPatterns(t *testing.T) {
 			[]int{6, 9},
 		},
 		{
-			"wrong center turns a symmetric pattern asymmetric",
-			// Symmetric about the origin, audited about (1,0).
+			"wrong center leaves the non-fixed hole uncovered",
+			// Symmetric about the origin, audited about (1,0): the
+			// (1,0) hole on line 6 is then a fixed point and passes;
+			// the (-1,0) hole needs a (3,0) hole that does not exist.
 			"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y0\nX-1Y0\nM30\n",
 			center("1", "0"),
-			[]int{6, 7},
+			[]int{7},
 		},
 	}
 	for _, tc := range cases {
@@ -629,10 +648,11 @@ func TestParseWithAudits_SymmetryKeepsExistingErrorPriority(t *testing.T) {
 }
 
 func TestParseWithAudits_ClearanceRunsBeforeSymmetry(t *testing.T) {
-	// Two coincident holes: a clearance conflict (line 7 vs line 6) and
-	// an odd self-mapping center count would both fail; the clearance
-	// audit aborts the parse first.
-	in := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX0Y0\nM30\n"
+	// Two coincident holes off-center at (1,0): the clearance audit
+	// fails (line 7 vs line 6) and the pair is also asymmetric about
+	// the origin (no (-1,0) holes); the clearance audit must abort the
+	// parse first.
+	in := "M48\nMETRIC\nT01C1.000\n%\nT01\nX1Y0\nX1Y0\nM30\n"
 	_, err := excellon.ParseWithAudits(in, dec("0.5"), center("0", "0"))
 	require.Error(t, err)
 	pe := err.(*excellon.ParseError)

@@ -116,10 +116,13 @@ func ParseWithClearance(text string, minClearance *decimal.Decimal) (*Report, er
 // ParseWithAudits behaves like ParseWithClearance and, when center is
 // non-nil, additionally verifies half-turn (180-degree) rotational
 // symmetry about that center, keyed by tool and exact normalized
-// coordinates. The symmetry audit runs only once the whole document has
-// passed syntax, number lexicon, tool references and the clearance
-// audit, so every pre-existing error keeps its priority; a pattern that
-// cannot be paired under rotation fails with
+// coordinates. Every non-fixed hole at p must be matched by a hole
+// drilled with the same tool at the rotated point 2*center - p; a
+// hole exactly at the center is a fixed point of the rotation and is
+// therefore symmetric at any multiplicity. The symmetry audit runs
+// only once the whole document has passed syntax, number lexicon, tool
+// references and the clearance audit, so every pre-existing error
+// keeps its priority; an unmatchable pattern fails with
 // CodeAsymmetricPattern. A nil center disables the symmetry audit.
 func ParseWithAudits(text string, minClearance *decimal.Decimal, center *SymmetryCenter) (*Report, error) {
 	lines := splitLines(text)
@@ -278,12 +281,12 @@ type asymKey struct {
 // asymmetricLines consumes rotatable pairs of validated holes and
 // returns the lines of holes left without a partner, in body line
 // order. Each hole at point p (tool t) pairs with a hole of the same
-// tool at 2*center - p; holes exactly at the center rotate to
-// themselves and therefore must occur an even number of times — they
-// pair with each other under a half-turn and an odd count leaves the
-// last occurrence uncovered. Duplicate holes are fungible: partners
-// are always the earliest still-available occurrence of the rotated
-// key (FIFO in body line order), so the uncovered source lines are
+// tool at 2*center - p; a hole exactly at the center is a fixed point
+// of the half-turn (2*center - p == p), so it maps onto itself and
+// passes at any multiplicity — count conservation holds trivially for
+// a self-mapping class. Duplicate holes are fungible: partners are
+// always the earliest still-available occurrence of the rotated key
+// (FIFO in body line order), so the uncovered source lines are
 // deterministic regardless of textual pairing order.
 func asymmetricLines(holes []placedHole, center SymmetryCenter) []int {
 	// Body-order indexes of every hole per class key, and the front of
@@ -296,19 +299,6 @@ func asymmetricLines(holes []placedHole, center SymmetryCenter) []int {
 	consumed := make([]bool, len(holes))
 	front := make(map[asymKey]int, len(indexes))
 
-	// Self-mapping classes (points exactly at the center) pair among
-	// themselves in body order: 1st with 2nd, 3rd with 4th, …; an odd
-	// count leaves the final occurrence uncovered.
-	for k, ids := range indexes {
-		if !keyIsCenter(k, center) {
-			continue
-		}
-		for j := 0; j+1 < len(ids); j += 2 {
-			consumed[ids[j]] = true
-			consumed[ids[j+1]] = true
-		}
-	}
-
 	cx := center.X.Mul(two)
 	cy := center.Y.Mul(two)
 
@@ -320,8 +310,9 @@ func asymmetricLines(holes []placedHole, center SymmetryCenter) []int {
 		}
 		k := keyOf(h)
 		if keyIsCenter(k, center) {
-			// The lone survivor of an odd-sized center class.
-			uncovered = append(uncovered, h.line)
+			// Fixed point of the half-turn: its own class is its
+			// rotated image, so any count is conserved and the hole
+			// covers itself.
 			continue
 		}
 		rk := asymKey{
