@@ -128,6 +128,98 @@ func main() {
 	_ = json.Unmarshal(body, &badParam)
 	a.Equal("INVALID_CLEARANCE", badParam["code"], "body: %s", body)
 
+	// 12. Exact half-turn symmetry about (0,0): T01 holes at
+	//     (1,2)/(-1,-2), T02 holes at (5,0)/(-5,0). The statistics are
+	//     identical to the no-parameter response.
+	symmetric := "M48\n" +
+		"METRIC\n" +
+		"T01C0.300\n" +
+		"T02C1.500\n" +
+		"%\n" +
+		"T01\n" +
+		"X1.000Y2.000\n" +
+		"X-1.000Y-2.000\n" +
+		"T02\n" +
+		"X5.000Y0\n" +
+		"X-5.000Y0\n" +
+		"M30\n"
+	resp, body = post(client, base+"/drill-files/statistics?symmetry_center=0,0", "text/plain", symmetric)
+	a.Equal(http.StatusOK, resp.StatusCode, "symmetric pattern must return 200: %s", body)
+	var symOK map[string]any
+	_ = json.Unmarshal(body, &symOK)
+	a.EqualValues(float64(4), symOK["total_holes"], "body: %s", body)
+	a.Equal("-5.000", symOK["min_x"], "body: %s", body)
+	a.Equal("5.000", symOK["max_x"], "body: %s", body)
+
+	// 13. Count imbalance: the T02 class has one hole at (5,0) but no
+	//     rotated partner at (-5,0), so the whole file is rejected with
+	//     422 ASYMMETRIC_PATTERN and the uncovered source line (10) is
+	//     listed in body line order.
+	imbalanced := "M48\n" +
+		"METRIC\n" +
+		"T01C0.300\n" +
+		"T02C1.500\n" +
+		"%\n" +
+		"T01\n" +
+		"X1.000Y2.000\n" +
+		"X-1.000Y-2.000\n" +
+		"T02\n" +
+		"X5.000Y0\n" +
+		"M30\n"
+	resp, body = post(client, base+"/drill-files/statistics?symmetry_center=0,0", "text/plain", imbalanced)
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "asymmetric pattern must return 422: %s", body)
+	var asym map[string]any
+	_ = json.Unmarshal(body, &asym)
+	a.Equal("ASYMMETRIC_PATTERN", asym["code"], "body: %s", body)
+	a.EqualValues(float64(10), asym["line"], "body: %s", body)
+	a.Equal([]any{float64(10)}, asym["uncovered_lines"], "body: %s", body)
+
+	// 14. A lone hole exactly at the center cannot self-match under a
+	//     half-turn, so self-mapping holes must conserve an even count.
+	selfMap := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nM30\n"
+	resp, body = post(client, base+"/drill-files/statistics?symmetry_center=0,0", "text/plain", selfMap)
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "lone center hole must return 422: %s", body)
+	var selfAsym map[string]any
+	_ = json.Unmarshal(body, &selfAsym)
+	a.Equal("ASYMMETRIC_PATTERN", selfAsym["code"], "body: %s", body)
+	a.EqualValues(float64(6), selfAsym["line"], "body: %s", body)
+
+	// 15. Audit priority: a file error is reported before the symmetry
+	//     audit even runs.
+	fileErr := "M48\nMETRIC\nT01C0.300\n%\nT02\nX1Y1\nM30\n"
+	resp, body = post(client, base+"/drill-files/statistics?symmetry_center=0,0", "text/plain", fileErr)
+	expect422(a, resp, body, "UNDEFINED_TOOL", 5)
+
+	// 16. Audit priority: a clearance conflict aborts before the
+	//     symmetry audit (coincident center holes fail both; the
+	//     clearance pair on lines 6/7 wins).
+	resp, body = post(client,
+		base+"/drill-files/statistics?min_clearance=0.5&symmetry_center=0,0",
+		"text/plain", "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX0Y0\nM30\n")
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "clearance must precede symmetry: %s", body)
+	var clearFirst map[string]any
+	_ = json.Unmarshal(body, &clearFirst)
+	a.Equal("HOLE_CLEARANCE", clearFirst["code"], "body: %s", body)
+	a.EqualValues(float64(7), clearFirst["line"], "body: %s", body)
+	a.EqualValues(float64(6), clearFirst["conflict_line"], "body: %s", body)
+
+	// 17. Invalid symmetry_center is a 400 client error, rejected before
+	//     the body is read (the body here is garbage on purpose) — and
+	//     the parameter may not be repeated.
+	resp, body = post(client, base+"/drill-files/statistics?symmetry_center=1", "text/plain", "GARBAGE\n")
+	a.Equal(http.StatusBadRequest, resp.StatusCode, "invalid center must return 400: %s", body)
+	var badCenter map[string]any
+	_ = json.Unmarshal(body, &badCenter)
+	a.Equal("INVALID_SYMMETRY", badCenter["code"], "body: %s", body)
+
+	resp, body = post(client,
+		base+"/drill-files/statistics?symmetry_center=0,0&symmetry_center=1,1",
+		"text/plain", "GARBAGE\n")
+	a.Equal(http.StatusBadRequest, resp.StatusCode, "repeated center must return 400: %s", body)
+	var dupCenter map[string]any
+	_ = json.Unmarshal(body, &dupCenter)
+	a.Equal("INVALID_SYMMETRY", dupCenter["code"], "body: %s", body)
+
 	if t.failed {
 		os.Exit(1)
 	}

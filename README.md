@@ -38,6 +38,14 @@
   恰好相切（等于）视为通过。比较全程使用距离平方与精确十进制运算，无开方、无浮点误差。
   参数非法（如 `-1`、`1.1234`、`01`）直接返回 `400 INVALID_CLEARANCE`，不进入文件解析；
   未传参时行为与响应与之前完全一致
+- 可选且**不可重复**的查询参数 `symmetry_center=x,y`：x、y 各为一个文件坐标词法的规范十进制
+  （允许负号与零），如 `symmetry_center=1.5,-2`。传入后在文件通过语法、数值、刀具引用及
+  `min_clearance` 审计之后启用**半周（180°）旋转对称审计**：以刀号与精确规范化坐标为键，
+  每个孔必须有同刀号孔位于旋转点 `2×center−point`；恰好位于中心的孔自映射，其计数也必须成对
+  守恒。任一旋转键数量不足即整份文件拒绝，返回 `422 ASYMMETRIC_PATTERN`，并按正文行序在
+  `uncovered_lines` 中给出配对后仍无对应孔的源行（`line` 为其中第一行）。参数重复或非法
+  （如 `1`、`0,01`、`-0,0`）直接返回 `400 INVALID_SYMMETRY`，在读取正文之前拒绝；
+  未传参时响应与之前完全一致
 - 成功：`200 OK`，JSON 响应
 - 文件内容不合法：`422 Unprocessable Entity`，JSON 错误体
 - 非 `text/plain`：`415 Unsupported Media Type`
@@ -74,6 +82,13 @@
 { "code": "HOLE_CLEARANCE", "line": 7, "conflict_line": 6 }
 ```
 
+旋转失衡的错误体会额外携带 `uncovered_lines`（按正文行序消耗可配对计数后，仍找不到同刀号
+旋转孔的源行；`line` 为其中第一行）：
+
+```json
+{ "code": "ASYMMETRIC_PATTERN", "line": 10, "uncovered_lines": [10] }
+```
+
 | code | 含义 |
 |---|---|
 | `LINE_ORDER` | 结构/指令错误：行序不对、出现不允许的指令、空行、缺行、CRLF、多余坐标轴等 |
@@ -82,9 +97,13 @@
 | `UNDEFINED_TOOL` | 正文选择了头部未定义的刀具（或未选刀就钻孔） |
 | `NO_HOLES` | 文件结构完整但正文没有任何钻孔记录 |
 | `HOLE_CLEARANCE` | 仅在传入 `min_clearance` 时出现：当前行孔位与 `conflict_line` 的较早孔位间距不足 |
+| `ASYMMETRIC_PATTERN` | 仅在传入 `symmetry_center` 时出现：孔图形关于该中心不保持半周旋转对称，`uncovered_lines` 为无旋转对应的源行 |
 
 间距审计只在行结构、数值词法、刀具引用全部合法之后执行，既有错误优先级不变；
 `min_clearance` 参数本身的非法值返回 `400 INVALID_CLEARANCE`（客户端错误），不会被当作文件错误。
+旋转对称审计在整份文件通过语法、数值、刀具引用与间距审计之后才执行，因此既有文件错误与间距错误
+始终先于对称审计；`symmetry_center` 参数本身的重复或非法值返回 `400 INVALID_SYMMETRY`
+（客户端错误），在读取正文之前拒绝，不会被当作文件错误。
 
 ### `GET /healthz`
 
@@ -125,6 +144,12 @@ M30                 # 最后一行必须是 M30
 5. 启用 `min_clearance` 审计时，间距检查排在同一行的结构、数值、刀具引用检查**之后**；
    每个通过校验的孔按正文行序与此前所有孔比较，首次冲突即在当前行报 `HOLE_CLEARANCE`
    并给出冲突的较早行 `conflict_line`。
+6. 启用 `symmetry_center` 审计时，对称检查在整份文件（含间距审计）全部通过**之后**才执行：
+   领域层以规范化三位小数坐标与刀号为键，把每个孔与其旋转键 `2×center−point` 的最早可用
+   同刀号孔消耗配对；恰好位于中心的自映射孔按正文行序两两配对，奇数个时最后一个无对应。
+   配对后仍剩余的源行按正文行序收集为 `uncovered_lines`，首行作为 `line`，报
+   `ASYMMETRIC_PATTERN`。重复孔可互换消耗，因此结果与正文配对顺序无关、确定可复现；
+   旋转点上若只有**不同刀号**的孔则不构成配对。
 
 ## 本地开发
 
@@ -158,7 +183,8 @@ docker compose logs verify          # 查看一次性检查结果（通过后退
 
 - `api` 服务：常驻，内置容器健康检查（自带 `/healthcheck` 探针，适配 distroless）
 - `verify` 服务：等待 `api` 健康后启动，跑一组成功/失败用例（成功体、三类 422、
-  最早错误、415、`min_clearance` 合法/相切/冲突/非法参数等），输出
+  最早错误、415、`min_clearance` 合法/相切/冲突/非法参数，以及 `symmetry_center`
+  精确对称成功、数量失衡、自映射、非法/重复参数、审计优先级等），输出
   `verify: all checks passed` 后退出；任一断言失败则退出码非 0
 
 镜像只由 `api` 服务声明一次构建；`verify` 复用同一个本地镜像（换用 `/verify`

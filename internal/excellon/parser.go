@@ -28,12 +28,13 @@ import (
 
 // Error codes returned by Parse. They are stable API values.
 const (
-	CodeLineOrder     = "LINE_ORDER"
-	CodeInvalidNumber = "INVALID_NUMBER"
-	CodeDuplicateTool = "DUPLICATE_TOOL"
-	CodeUndefinedTool = "UNDEFINED_TOOL"
-	CodeNoHoles       = "NO_HOLES"
-	CodeHoleClearance = "HOLE_CLEARANCE"
+	CodeLineOrder         = "LINE_ORDER"
+	CodeInvalidNumber     = "INVALID_NUMBER"
+	CodeDuplicateTool     = "DUPLICATE_TOOL"
+	CodeUndefinedTool     = "UNDEFINED_TOOL"
+	CodeNoHoles           = "NO_HOLES"
+	CodeHoleClearance     = "HOLE_CLEARANCE"
+	CodeAsymmetricPattern = "ASYMMETRIC_PATTERN"
 )
 
 // ParseError identifies the first invalid line of a document.
@@ -43,13 +44,28 @@ type ParseError struct {
 	// ConflictLine is set only for CodeHoleClearance: the 1-based line of
 	// the earlier hole whose clearance zone the hole at Line violates.
 	ConflictLine int
+	// UncoveredLines is set only for CodeAsymmetricPattern: the 1-based
+	// lines of the holes left without a rotation partner, in body line
+	// order after deterministic pairing. Line is the first of them.
+	UncoveredLines []int
 }
 
 func (e *ParseError) Error() string {
-	if e.Code == CodeHoleClearance {
+	switch {
+	case e.Code == CodeHoleClearance:
 		return fmt.Sprintf("line %d: %s (conflicts with line %d)", e.Line, e.Code, e.ConflictLine)
+	case len(e.UncoveredLines) > 0:
+		return fmt.Sprintf("line %d: %s (uncovered lines %v)", e.Line, e.Code, e.UncoveredLines)
+	default:
+		return fmt.Sprintf("line %d: %s", e.Line, e.Code)
 	}
-	return fmt.Sprintf("line %d: %s", e.Line, e.Code)
+}
+
+// SymmetryCenter is the pivot of the optional half-turn audit: every hole
+// at point p must be matched by a hole drilled with the same tool at the
+// rotated point 2*center - p.
+type SymmetryCenter struct {
+	X, Y decimal.Decimal
 }
 
 // ToolCount reports how many holes were drilled with one tool.
@@ -94,6 +110,18 @@ func Parse(text string) (*Report, error) {
 // and the earlier ConflictLine. A nil minClearance disables the audit
 // entirely.
 func ParseWithClearance(text string, minClearance *decimal.Decimal) (*Report, error) {
+	return ParseWithAudits(text, minClearance, nil)
+}
+
+// ParseWithAudits behaves like ParseWithClearance and, when center is
+// non-nil, additionally verifies half-turn (180-degree) rotational
+// symmetry about that center, keyed by tool and exact normalized
+// coordinates. The symmetry audit runs only once the whole document has
+// passed syntax, number lexicon, tool references and the clearance
+// audit, so every pre-existing error keeps its priority; a pattern that
+// cannot be paired under rotation fails with
+// CodeAsymmetricPattern. A nil center disables the symmetry audit.
+func ParseWithAudits(text string, minClearance *decimal.Decimal, center *SymmetryCenter) (*Report, error) {
 	lines := splitLines(text)
 
 	diameters := make(map[string]decimal.Decimal)
@@ -101,9 +129,11 @@ func ParseWithClearance(text string, minClearance *decimal.Decimal) (*Report, er
 	counts := make(map[string]int)
 	selected := ""
 	holeCount := 0
-	// Validated hole positions in body line order; only populated while
-	// the clearance audit is active.
+	// Validated holes in body line order; only populated while at least
+	// one post-parse audit is active. The clearance audit reads radii,
+	// the symmetry audit reads tool and position.
 	var holes []placedHole
+	auditsOn := minClearance != nil || center != nil
 
 	ph := phaseHeader
 	var minX, minY, maxX, maxY decimal.Decimal
@@ -155,6 +185,11 @@ func ParseWithClearance(text string, minClearance *decimal.Decimal) (*Report, er
 			if holeCount == 0 {
 				return nil, &ParseError{Line: lineNo, Code: CodeNoHoles}
 			}
+			if center != nil {
+				if uncovered := asymmetricLines(holes, *center); len(uncovered) > 0 {
+					return nil, &ParseError{Line: uncovered[0], Code: CodeAsymmetricPattern, UncoveredLines: uncovered}
+				}
+			}
 			return buildReport(toolOrder, counts, holeCount, minX, minY, maxX, maxY), nil
 		}
 
@@ -179,22 +214,25 @@ func ParseWithClearance(text string, minClearance *decimal.Decimal) (*Report, er
 		}
 		x, _ := decimal.NewFromString(xs)
 		y, _ := decimal.NewFromString(ys)
-		if minClearance != nil {
-			radius := diameters[selected].Div(two)
-			for _, h := range holes {
-				// Squared comparison only: conflict iff
-				//   dx² + dy² < (r₁ + r₂ + minClearance)²
-				// Exact decimal arithmetic (halving a diameter is exact
-				// in decimal) avoids square roots and rounding error;
-				// equality — exactly tangent holes — passes.
-				need := h.radius.Add(radius).Add(*minClearance)
-				dx := x.Sub(h.x)
-				dy := y.Sub(h.y)
-				if dx.Mul(dx).Add(dy.Mul(dy)).Cmp(need.Mul(need)) < 0 {
-					return nil, &ParseError{Line: lineNo, Code: CodeHoleClearance, ConflictLine: h.line}
+		if auditsOn {
+			h := placedHole{line: lineNo, tool: selected, x: x, y: y}
+			if minClearance != nil {
+				h.radius = diameters[selected].Div(two)
+				for _, prev := range holes {
+					// Squared comparison only: conflict iff
+					//   dx² + dy² < (r₁ + r₂ + minClearance)²
+					// Exact decimal arithmetic (halving a diameter is exact
+					// in decimal) avoids square roots and rounding error;
+					// equality — exactly tangent holes — passes.
+					need := prev.radius.Add(h.radius).Add(*minClearance)
+					dx := x.Sub(prev.x)
+					dy := y.Sub(prev.y)
+					if dx.Mul(dx).Add(dy.Mul(dy)).Cmp(need.Mul(need)) < 0 {
+						return nil, &ParseError{Line: lineNo, Code: CodeHoleClearance, ConflictLine: prev.line}
+					}
 				}
 			}
-			holes = append(holes, placedHole{line: lineNo, x: x, y: y, radius: radius})
+			holes = append(holes, h)
 		}
 		counts[selected]++
 		if holeCount == 0 {
@@ -220,12 +258,107 @@ func ParseWithClearance(text string, minClearance *decimal.Decimal) (*Report, er
 	return nil, &ParseError{Line: len(lines) + 1, Code: CodeLineOrder}
 }
 
-// placedHole is a validated hole position kept, in body line order, for
-// the clearance audit.
+// placedHole is a validated hole kept, in body line order, for the
+// post-parse audits. radius is only populated while the clearance audit
+// is active.
 type placedHole struct {
 	line   int
+	tool   string
 	x, y   decimal.Decimal
 	radius decimal.Decimal
+}
+
+// asymKey identifies one class of hole: the selected tool and the exact
+// normalized (three-decimal, sign-preserving) coordinates.
+type asymKey struct {
+	tool string
+	x, y string
+}
+
+// asymmetricLines consumes rotatable pairs of validated holes and
+// returns the lines of holes left without a partner, in body line
+// order. Each hole at point p (tool t) pairs with a hole of the same
+// tool at 2*center - p; holes exactly at the center rotate to
+// themselves and therefore must occur an even number of times — they
+// pair with each other under a half-turn and an odd count leaves the
+// last occurrence uncovered. Duplicate holes are fungible: partners
+// are always the earliest still-available occurrence of the rotated
+// key (FIFO in body line order), so the uncovered source lines are
+// deterministic regardless of textual pairing order.
+func asymmetricLines(holes []placedHole, center SymmetryCenter) []int {
+	// Body-order indexes of every hole per class key, and the front of
+	// each queue while partners are consumed.
+	indexes := make(map[asymKey][]int)
+	for i, h := range holes {
+		k := keyOf(h)
+		indexes[k] = append(indexes[k], i)
+	}
+	consumed := make([]bool, len(holes))
+	front := make(map[asymKey]int, len(indexes))
+
+	// Self-mapping classes (points exactly at the center) pair among
+	// themselves in body order: 1st with 2nd, 3rd with 4th, …; an odd
+	// count leaves the final occurrence uncovered.
+	for k, ids := range indexes {
+		if !keyIsCenter(k, center) {
+			continue
+		}
+		for j := 0; j+1 < len(ids); j += 2 {
+			consumed[ids[j]] = true
+			consumed[ids[j+1]] = true
+		}
+	}
+
+	cx := center.X.Mul(two)
+	cy := center.Y.Mul(two)
+
+	var uncovered []int
+	for i, h := range holes {
+		if consumed[i] {
+			// Already consumed as another hole's partner.
+			continue
+		}
+		k := keyOf(h)
+		if keyIsCenter(k, center) {
+			// The lone survivor of an odd-sized center class.
+			uncovered = append(uncovered, h.line)
+			continue
+		}
+		rk := asymKey{
+			tool: h.tool,
+			x:    formatDecimal(cx.Sub(h.x)),
+			y:    formatDecimal(cy.Sub(h.y)),
+		}
+		// Consume the earliest unconsumed rotated occurrence, which may
+		// appear later in the file; advancing the FIFO first is what
+		// keeps duplicate pairing deterministic.
+		for front[rk] < len(indexes[rk]) {
+			j := indexes[rk][front[rk]]
+			front[rk]++
+			if !consumed[j] {
+				consumed[i] = true
+				consumed[j] = true
+				break
+			}
+		}
+		if !consumed[i] {
+			uncovered = append(uncovered, h.line)
+		}
+	}
+	return uncovered
+}
+
+func keyOf(h placedHole) asymKey {
+	return asymKey{tool: h.tool, x: formatDecimal(h.x), y: formatDecimal(h.y)}
+}
+
+// keyIsCenter reports whether the key's coordinates are numerically
+// equal to the symmetry center (exact decimal equality, so "0" and
+// "0.000" are the same class).
+func keyIsCenter(k asymKey, center SymmetryCenter) bool {
+	x, errX := decimal.NewFromString(k.x)
+	y, errY := decimal.NewFromString(k.y)
+	return errX == nil && errY == nil && x.Equal(center.X) && y.Equal(center.Y)
 }
 
 // two is the exact divisor turning a tool diameter into its radius.
@@ -241,6 +374,24 @@ func ParseClearance(s string) (decimal.Decimal, bool) {
 	}
 	d, _ := decimal.NewFromString(s)
 	return d, true
+}
+
+// ParseSymmetryCenter validates a symmetry_center query value as
+// "x,y", each half using the file coordinate lexicon (canonical
+// decimal, sign and zero allowed), and returns the exact center.
+func ParseSymmetryCenter(s string) (SymmetryCenter, bool) {
+	comma := strings.IndexByte(s, ',')
+	// Exactly one comma, both halves non-empty.
+	if comma < 0 || comma != strings.LastIndexByte(s, ',') {
+		return SymmetryCenter{}, false
+	}
+	xs, ys := s[:comma], s[comma+1:]
+	if !isCanonicalNumber(xs, true, true) || !isCanonicalNumber(ys, true, true) {
+		return SymmetryCenter{}, false
+	}
+	x, _ := decimal.NewFromString(xs)
+	y, _ := decimal.NewFromString(ys)
+	return SymmetryCenter{X: x, Y: y}, true
 }
 
 // splitLines splits on LF. A single trailing LF is treated as the line

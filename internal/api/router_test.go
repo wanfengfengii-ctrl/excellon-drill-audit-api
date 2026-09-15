@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -176,4 +177,170 @@ func TestStatistics_NoClearanceParamKeepsBehavior(t *testing.T) {
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(raw, &got))
 	assert.EqualValues(t, 2, got["total_holes"])
+}
+
+// symmetryOK is a half-turn-symmetric program about (0,0): T01 holes at
+// (1,2)/(-1,-2) and T02 holes at (5,0)/(-5,0), lines 6..9.
+const symmetryOK = "M48\nMETRIC\nT01C0.300\nT02C1.500\n%\nT01\nX1.000Y2.000\nX-1.000Y-2.000\nT02\nX5.000Y0\nX-5.000Y0\nM30\n"
+
+func TestStatistics_SymmetryCenterSuccess(t *testing.T) {
+	w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", symmetryOK)
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+
+	// A passing audit leaves the statistics response unchanged.
+	var withCenter map[string]any
+	require.NoError(t, json.Unmarshal(raw, &withCenter))
+	w2, raw2 := post(t, api.Router(), "text/plain", symmetryOK)
+	require.Equal(t, http.StatusOK, w2.Code, string(raw2))
+	var withoutCenter map[string]any
+	require.NoError(t, json.Unmarshal(raw2, &withoutCenter))
+	assert.Equal(t, withoutCenter, withCenter)
+	assert.EqualValues(t, 4, withCenter["total_holes"])
+}
+
+func TestStatistics_SymmetryCenterNonOrigin(t *testing.T) {
+	// (1,2) rotated about (1.5,1) lands at (2,0): 2*1.5-1 = 2, 2*1-2 = 0.
+	body := "M48\nMETRIC\nT01C0.300\n%\nT01\nX1Y2\nX2Y0\nM30\n"
+	w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=1.5,1", "text/plain", body)
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+}
+
+func TestStatistics_SelfMappingCenterHoles(t *testing.T) {
+	// Two holes exactly at the center pair with each other; a lone
+	// center hole cannot self-match.
+	pair := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nX0Y0\nX1Y0\nX-1Y0\nM30\n"
+	w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", pair)
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+
+	lone := "M48\nMETRIC\nT01C0.300\n%\nT01\nX0Y0\nM30\n"
+	w, raw = postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", lone)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "ASYMMETRIC_PATTERN", got["code"])
+	assert.EqualValues(t, 6, got["line"])
+	assert.Equal(t, []any{float64(6)}, got["uncovered_lines"])
+	assert.NotContains(t, string(raw), "total_holes")
+}
+
+func TestStatistics_AsymmetricPatternListsUncoveredLines(t *testing.T) {
+	// Lines 7/8 pair under T01; the T02 hole on line 10 (5,0) has no
+	// T02 partner at (-5,0), so line 10 is uncovered.
+	body := "M48\nMETRIC\nT01C0.300\nT02C1.500\n%\nT01\nX1.000Y2.000\nX-1.000Y-2.000\nT02\nX5.000Y0\nM30\n"
+	w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", body)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "ASYMMETRIC_PATTERN", got["code"])
+	assert.EqualValues(t, 10, got["line"])
+	assert.Equal(t, []any{float64(10)}, got["uncovered_lines"])
+}
+
+func TestStatistics_DifferentToolDoesNotPair(t *testing.T) {
+	// (1,0) with T01 and (-1,0) with T02: geometrically symmetric but
+	// different tool classes, so both hole lines are uncovered in order.
+	body := "M48\nMETRIC\nT01C0.1\nT02C0.2\n%\nT01\nX1Y0\nT02\nX-1Y0\nM30\n"
+	w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", body)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "ASYMMETRIC_PATTERN", got["code"])
+	assert.Equal(t, []any{float64(7), float64(9)}, got["uncovered_lines"])
+}
+
+func TestStatistics_InvalidSymmetryCenter(t *testing.T) {
+	bad := []string{
+		"", "0", "0,", ",0", ",", "0,0,0",
+		"abc,0", "0,abc", "01,0", "0,01", "0.1234,0", "0,0.1234",
+		"-0,0", "0,-0.000", "1.,0", ".5,0", "+1,0", "0,1e3",
+		"0 0", "0, 0",
+	}
+	for _, v := range bad {
+		t.Run("value/"+v, func(t *testing.T) {
+			w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center="+url.QueryEscape(v), "text/plain", symmetryOK)
+			require.Equal(t, http.StatusBadRequest, w.Code, string(raw))
+
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(raw, &got))
+			assert.Equal(t, "INVALID_SYMMETRY", got["code"])
+			assert.NotContains(t, string(raw), "line")
+		})
+	}
+}
+
+func TestStatistics_RepeatedSymmetryCenterRejected(t *testing.T) {
+	// The parameter is non-repeatable, even when both values are valid;
+	// the garbage body proves the query is rejected before it is read.
+	w, raw := postPath(t, api.Router(),
+		"/drill-files/statistics?symmetry_center=0,0&symmetry_center=1,1",
+		"text/plain", "GARBAGE\n")
+	require.Equal(t, http.StatusBadRequest, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "INVALID_SYMMETRY", got["code"])
+	assert.NotContains(t, string(raw), "LINE_ORDER")
+}
+
+func TestStatistics_InvalidSymmetryNotMaskedByFileError(t *testing.T) {
+	// The body would fail parsing on line 1, but the invalid parameter
+	// is a client error rejected first, before the body is read.
+	w, raw := postPath(t, api.Router(),
+		"/drill-files/statistics?symmetry_center=-1", "text/plain", "GARBAGE\n")
+	require.Equal(t, http.StatusBadRequest, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "INVALID_SYMMETRY", got["code"])
+	assert.NotContains(t, string(raw), "LINE_ORDER")
+}
+
+func TestStatistics_FileErrorBeatsSymmetryAudit(t *testing.T) {
+	// Undefined T02 on line 5: the symmetry audit never runs.
+	body := "M48\nMETRIC\nT01C0.300\n%\nT02\nX1Y1\nM30\n"
+	w, raw := postPath(t, api.Router(), "/drill-files/statistics?symmetry_center=0,0", "text/plain", body)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "UNDEFINED_TOOL", got["code"])
+	assert.EqualValues(t, 5, got["line"])
+	assert.NotContains(t, string(raw), "ASYMMETRIC_PATTERN")
+}
+
+func TestStatistics_ClearanceBeatsSymmetryAudit(t *testing.T) {
+	// Coincident center holes: the clearance audit fails first (line 7
+	// vs line 6); the odd self-mapping count never surfaces.
+	body := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX0Y0\nM30\n"
+	path := "/drill-files/statistics?min_clearance=0.5&symmetry_center=0,0"
+	w, raw := postPath(t, api.Router(), path, "text/plain", body)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "HOLE_CLEARANCE", got["code"])
+	assert.EqualValues(t, 7, got["line"])
+	assert.EqualValues(t, 6, got["conflict_line"])
+	assert.NotContains(t, string(raw), "ASYMMETRIC_PATTERN")
+}
+
+func TestStatistics_BothAuditsPass(t *testing.T) {
+	// Holes 3 apart (need 1.5) form a half-turn pair about (1.5,0).
+	body := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX3Y0\nM30\n"
+	path := "/drill-files/statistics?min_clearance=0.5&symmetry_center=1.5,0"
+	w, raw := postPath(t, api.Router(), path, "text/plain", body)
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+}
+
+func TestStatistics_NoSymmetryParamKeepsBehavior(t *testing.T) {
+	// A lone off-center hole would fail the symmetry audit; without the
+	// parameter the response is unchanged from before the feature.
+	body := "M48\nMETRIC\nT01C0.300\n%\nT01\nX1Y1\nM30\n"
+	w, raw := post(t, api.Router(), "text/plain", body)
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.EqualValues(t, 1, got["total_holes"])
 }

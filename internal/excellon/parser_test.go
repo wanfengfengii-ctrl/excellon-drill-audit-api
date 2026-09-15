@@ -1,6 +1,7 @@
 package excellon_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -380,4 +381,286 @@ func TestParseClearance(t *testing.T) {
 			assert.False(t, ok)
 		})
 	}
+}
+
+// symmetryFile drills two holes at (1,2) and (-1,-2), a half-turn about
+// the origin, plus a T02 hole at (5,0) with no partner.
+const symmetryFile = "M48\nMETRIC\nT01C0.300\nT02C1.500\n%\nT01\nX1.000Y2.000\nX-1.000Y-2.000\nT02\nX5.000Y0\nM30\n"
+
+func TestParseSymmetryCenter(t *testing.T) {
+	valid := []struct {
+		in   string
+		x, y string
+	}{
+		{"0,0", "0", "0"},
+		{"1.5,-2.25", "1.5", "-2.25"},
+		{"-0.5,0.001", "-0.5", "0.001"},
+		{"12,-3", "12", "-3"},
+	}
+	for _, tc := range valid {
+		t.Run("valid/"+tc.in, func(t *testing.T) {
+			got, ok := excellon.ParseSymmetryCenter(tc.in)
+			require.True(t, ok)
+			x, _ := decimal.NewFromString(tc.x)
+			y, _ := decimal.NewFromString(tc.y)
+			assert.True(t, got.X.Equal(x), "x mismatch for %q", tc.in)
+			assert.True(t, got.Y.Equal(y), "y mismatch for %q", tc.in)
+		})
+	}
+
+	invalid := []string{
+		"", "1", "1,", ",1", "1,2,3", ",",
+		"abc,1", "1,abc", "01,1", "1,01", "1.1234,1", "1,1.1234",
+		"-0,1", "1,-0.0", "1.,1", ".5,1", "+1,1", "1e3,0",
+		"1 2", "1, 2", " 1,2", "1,2 ",
+	}
+	for _, s := range invalid {
+		t.Run("invalid/"+s, func(t *testing.T) {
+			_, ok := excellon.ParseSymmetryCenter(s)
+			assert.False(t, ok)
+		})
+	}
+}
+
+func center(x, y string) *excellon.SymmetryCenter {
+	cx, _ := decimal.NewFromString(x)
+	cy, _ := decimal.NewFromString(y)
+	return &excellon.SymmetryCenter{X: cx, Y: cy}
+}
+
+func TestParseWithAudits_ExactHalfTurnSymmetry(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		c    *excellon.SymmetryCenter
+	}{
+		{
+			"pair about origin",
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX1.000Y2.000\nX-1.000Y-2.000\nM30\n",
+			center("0", "0"),
+		},
+		{
+			"pair about non-origin center",
+			// 2*(1.5,1) - (1,2) = (2,0).
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y2\nX2Y0\nM30\n",
+			center("1.5", "1"),
+		},
+		{
+			"negative center with zero coordinate",
+			// 2*(-0.5,0) - (-1,0) = (0,0); lexical "0" and "0.000"
+			// normalize to the same key.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX-1.000Y0\nX0Y0.000\nM30\n",
+			center("-0.5", "0"),
+		},
+		{
+			"duplicate holes keep the counts equal",
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y0\nX1Y0\nX-1Y0\nX-1Y0\nM30\n",
+			center("0", "0"),
+		},
+		{
+			"self-mapping center holes conserved in pairs",
+			// Holes exactly at the center pair with each other; other
+			// holes pair normally.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nX0Y0\nX1Y0\nX-1Y0\nM30\n",
+			center("0", "0"),
+		},
+		{
+			"symmetry is per tool",
+			// T01 pair and T02 pair independently.
+			"M48\nMETRIC\nT01C0.1\nT02C0.2\n%\nT01\nX1Y0\nT02\nX1Y0\nT01\nX-1Y0\nT02\nX-1Y0\nM30\n",
+			center("0", "0"),
+		},
+		{
+			"symmetric subset of the two-tool fixture",
+			// Remove the unpaired T02 hole from symmetryFile.
+			"M48\nMETRIC\nT01C0.300\nT02C1.500\n%\nT01\nX1.000Y2.000\nX-1.000Y-2.000\nM30\n",
+			center("0", "0"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want, err := excellon.Parse(tc.in)
+			require.NoError(t, err)
+			got, err := excellon.ParseWithAudits(tc.in, nil, tc.c)
+
+			require.NoError(t, err)
+			// A passing audit must not alter the statistics.
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+func TestParseWithAudits_AsymmetricPatterns(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        string
+		c         *excellon.SymmetryCenter
+		uncovered []int
+	}{
+		{
+			"single self-mapping center hole cannot pair with itself",
+			// Line 6 is the only hole and sits exactly on the center.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nM30\n",
+			center("0", "0"),
+			[]int{6},
+		},
+		{
+			"three center holes leave one uncovered",
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX0Y0\nX0Y0\nX0Y0\nM30\n",
+			center("0", "0"),
+			[]int{8},
+		},
+		{
+			"missing rotated partner",
+			// symmetryFile: the lone T02 hole (5,0) is on line 10.
+			symmetryFile,
+			center("0", "0"),
+			[]int{10},
+		},
+		{
+			"duplicate source exhausts the partner count",
+			// Two (1,0) holes, one (-1,0): the second (1,0) on line 8
+			// is uncovered; line 9 was consumed earlier as its partner.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y0\nX1Y0\nX-1Y0\nM30\n",
+			center("0", "0"),
+			[]int{7},
+		},
+		{
+			"same imbalance with reversed textual order",
+			// The extra (-1,0) is the second occurrence, again line 7;
+			// pairing order cannot change the result.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX-1Y0\nX-1Y0\nX1Y0\nM30\n",
+			center("0", "0"),
+			[]int{7},
+		},
+		{
+			"rotated point drilled with another tool never pairs",
+			// T01@(1,0) would need T01@(-1,0); a T02 hole there is a
+			// different key, so both source lines are uncovered.
+			"M48\nMETRIC\nT01C0.1\nT02C0.2\n%\nT01\nX1Y0\nT02\nX-1Y0\nM30\n",
+			center("0", "0"),
+			[]int{7, 9},
+		},
+		{
+			"uncovered lines stay in body line order",
+			// Lines 6 and 9 unpaired; line 7's partner is line 8.
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y0\nX2Y0\nX-2Y0\nX5Y0\nM30\n",
+			center("0", "0"),
+			[]int{6, 9},
+		},
+		{
+			"wrong center turns a symmetric pattern asymmetric",
+			// Symmetric about the origin, audited about (1,0).
+			"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y0\nX-1Y0\nM30\n",
+			center("1", "0"),
+			[]int{6, 7},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := excellon.ParseWithAudits(tc.in, nil, tc.c)
+			require.Error(t, err)
+			pe, ok := err.(*excellon.ParseError)
+			require.True(t, ok, "error must be *ParseError, got %T", err)
+			assert.Equal(t, excellon.CodeAsymmetricPattern, pe.Code)
+			assert.Equal(t, tc.uncovered, pe.UncoveredLines)
+			assert.Equal(t, tc.uncovered[0], pe.Line)
+			assert.Zero(t, pe.ConflictLine)
+		})
+	}
+}
+
+func TestParseWithAudits_DuplicateDeterminismAcrossPermutations(t *testing.T) {
+	// Three T01 holes at (1,0) and one at (-1,0) in every body
+	// permutation: exactly two (1,0) holes stay uncovered, and they
+	// must be the surplus class in every ordering — the single (-1,0)
+	// hole is always consumed as the earliest available partner, so the
+	// uncovered class never depends on textual pairing order.
+	perms := []string{
+		"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y0\nX1Y0\nX1Y0\nX-1Y0\nM30\n",
+		"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y0\nX1Y0\nX-1Y0\nX1Y0\nM30\n",
+		"M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y0\nX-1Y0\nX1Y0\nX1Y0\nM30\n",
+		"M48\nMETRIC\nT01C0.1\n%\nT01\nX-1Y0\nX1Y0\nX1Y0\nX1Y0\nM30\n",
+	}
+	for i, in := range perms {
+		_, err := excellon.ParseWithAudits(in, nil, center("0", "0"))
+		require.Error(t, err)
+		pe := err.(*excellon.ParseError)
+		assert.Equal(t, excellon.CodeAsymmetricPattern, pe.Code)
+		require.Len(t, pe.UncoveredLines, 2, "permutation %d", i)
+		docLines := strings.Split(in, "\n")
+		for _, ln := range pe.UncoveredLines {
+			assert.Equal(t, "X1Y0", docLines[ln-1], "permutation %d: only surplus (1,0) holes may be uncovered", i)
+		}
+		// Uncovered lines are reported in body line order.
+		assert.Equal(t, pe.UncoveredLines[0], pe.Line, "permutation %d", i)
+		assert.Less(t, pe.UncoveredLines[0], pe.UncoveredLines[1], "permutation %d", i)
+	}
+}
+
+func TestParseWithAudits_SymmetryKeepsExistingErrorPriority(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		line int
+		code string
+	}{
+		// Structural failure on line 1 beats the symmetry audit.
+		{"structure error", "GARBAGE\n", 1, excellon.CodeLineOrder},
+		// Lexicon failure on line 6 beats the missing partner.
+		{"invalid number",
+			"M48\nMETRIC\nT01C1.000\n%\nT01\nX01Y0\nX0Y0\nM30\n",
+			6, excellon.CodeInvalidNumber},
+		// Undefined tool reference beats the missing partner.
+		{"undefined tool",
+			"M48\nMETRIC\nT01C1.000\n%\nT09\nX1Y0\nM30\n",
+			5, excellon.CodeUndefinedTool},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := excellon.ParseWithAudits(tc.in, nil, center("0", "0"))
+			require.Error(t, err)
+			pe := err.(*excellon.ParseError)
+			assert.Equal(t, tc.code, pe.Code)
+			assert.Equal(t, tc.line, pe.Line)
+			assert.Empty(t, pe.UncoveredLines)
+		})
+	}
+}
+
+func TestParseWithAudits_ClearanceRunsBeforeSymmetry(t *testing.T) {
+	// Two coincident holes: a clearance conflict (line 7 vs line 6) and
+	// an odd self-mapping center count would both fail; the clearance
+	// audit aborts the parse first.
+	in := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX0Y0\nM30\n"
+	_, err := excellon.ParseWithAudits(in, dec("0.5"), center("0", "0"))
+	require.Error(t, err)
+	pe := err.(*excellon.ParseError)
+	assert.Equal(t, excellon.CodeHoleClearance, pe.Code)
+	assert.Equal(t, 7, pe.Line)
+	assert.Equal(t, 6, pe.ConflictLine)
+	assert.Empty(t, pe.UncoveredLines)
+}
+
+func TestParseWithAudits_BothAuditsPassTogether(t *testing.T) {
+	in := "M48\nMETRIC\nT01C1.000\n%\nT01\nX0Y0\nX3Y0\nM30\n"
+	// Center distance 3, need 1 + 0.5 = 1.5; half-turn pair about
+	// (1.5, 0).
+	r, err := excellon.ParseWithAudits(in, dec("0.5"), center("1.5", "0"))
+	require.NoError(t, err)
+	assert.Equal(t, 2, r.Total)
+}
+
+func TestParseWithAudits_NilCenterDisablesSymmetry(t *testing.T) {
+	// A lone off-center hole would fail the symmetry audit but parses
+	// identically to ParseWithClearance without one.
+	in := "M48\nMETRIC\nT01C0.1\n%\nT01\nX1Y1\nM30\n"
+	r, err := excellon.ParseWithAudits(in, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, r.Total)
+}
+
+func TestParseError_AsymmetryMessage(t *testing.T) {
+	e := &excellon.ParseError{Line: 9, Code: excellon.CodeAsymmetricPattern, UncoveredLines: []int{9, 11}}
+	assert.Equal(t, "line 9: ASYMMETRIC_PATTERN (uncovered lines [9 11])", e.Error())
 }

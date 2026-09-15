@@ -22,6 +22,10 @@ type ErrorBody struct {
 	// ConflictLine is set only for HOLE_CLEARANCE: the earlier hole the
 	// hole at Line collides with.
 	ConflictLine int `json:"conflict_line,omitempty"`
+	// UncoveredLines is set only for ASYMMETRIC_PATTERN: every hole line
+	// left without a rotation partner, in body line order; Line is the
+	// first of them.
+	UncoveredLines []int `json:"uncovered_lines,omitempty"`
 }
 
 // Router builds the application's HTTP handler.
@@ -58,6 +62,23 @@ func postStatistics(c *gin.Context) {
 		clearance = &d
 	}
 
+	// Optional, non-repeatable symmetry_center audit parameter:
+	// "x,y" in the file coordinate lexicon. A repeated or malformed
+	// value is a client error, rejected before the body is read.
+	var center *excellon.SymmetryCenter
+	if vals, present := c.GetQueryArray("symmetry_center"); present {
+		if len(vals) != 1 {
+			c.JSON(http.StatusBadRequest, ErrorBody{Code: "INVALID_SYMMETRY"})
+			return
+		}
+		sc, ok := excellon.ParseSymmetryCenter(vals[0])
+		if !ok {
+			c.JSON(http.StatusBadRequest, ErrorBody{Code: "INVALID_SYMMETRY"})
+			return
+		}
+		center = &sc
+	}
+
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBodyBytes+1))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, ErrorBody{Code: "BAD_REQUEST"})
@@ -68,10 +89,15 @@ func postStatistics(c *gin.Context) {
 		return
 	}
 
-	report, err := excellon.ParseWithClearance(string(body), clearance)
+	report, err := excellon.ParseWithAudits(string(body), clearance, center)
 	if err != nil {
 		pe := err.(*excellon.ParseError)
-		c.JSON(http.StatusUnprocessableEntity, ErrorBody{Code: pe.Code, Line: pe.Line, ConflictLine: pe.ConflictLine})
+		c.JSON(http.StatusUnprocessableEntity, ErrorBody{
+			Code:           pe.Code,
+			Line:           pe.Line,
+			ConflictLine:   pe.ConflictLine,
+			UncoveredLines: pe.UncoveredLines,
+		})
 		return
 	}
 	c.JSON(http.StatusOK, report)
