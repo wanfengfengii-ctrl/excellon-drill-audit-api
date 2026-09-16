@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"time"
@@ -231,6 +232,147 @@ func main() {
 	_ = json.Unmarshal(body, &dupCenter)
 	a.Equal("INVALID_SYMMETRY", dupCenter["code"], "body: %s", body)
 
+	// 18. Panel audit: three instances of the asymmetric L template at
+	//     angle 0, offsets (10,5), (20,3), (30,8); instances come back
+	//     sorted by anchor coordinates.
+	auditTemplate := "M48\nMETRIC\nT01C0.500\n%\nT01\nX0Y0\nX2Y0\nX0Y1\nM30\n"
+	panel3 := "M48\nMETRIC\nT01C0.500\n%\nT01\n" +
+		"X10Y5\nX12Y5\nX10Y6\n" +
+		"X20Y3\nX22Y3\nX20Y4\n" +
+		"X30Y8\nX32Y8\nX30Y9\n" +
+		"M30\n"
+	resp, body = postMultipart(client, base+"/drill-files/panel-audit",
+		map[string]string{"template": auditTemplate, "panel": panel3})
+	a.Equal(http.StatusOK, resp.StatusCode, "multi-instance panel must return 200: %s", body)
+	var audit map[string]any
+	_ = json.Unmarshal(body, &audit)
+	layouts, _ := audit["layouts"].([]any)
+	a.Equal(1, len(layouts), "body: %s", body)
+	if len(layouts) == 1 {
+		layout := layouts[0].(map[string]any)
+		a.EqualValues(0, layout["angle"], "body: %s", body)
+		instances, _ := layout["instances"].([]any)
+		a.Equal(3, len(instances), "body: %s", body)
+		wantOffsets := [][2]string{{"10.000", "5.000"}, {"20.000", "3.000"}, {"30.000", "8.000"}}
+		for i, inst := range instances {
+			m := inst.(map[string]any)
+			a.Equal(wantOffsets[i][0], m["offset_x"], "instance %d, body: %s", i, body)
+			a.Equal(wantOffsets[i][1], m["offset_y"], "instance %d, body: %s", i, body)
+			a.Equal(wantOffsets[i][0], m["anchor_x"], "instance %d, body: %s", i, body)
+			a.Equal(wantOffsets[i][1], m["anchor_y"], "instance %d, body: %s", i, body)
+		}
+	}
+
+	// 19. Rotation recognition: the panel is the template rotated 90
+	//     degrees counterclockwise and translated by (10,10).
+	panel90 := "M48\nMETRIC\nT01C0.500\n%\nT01\nX10Y10\nX10Y12\nX9Y10\nM30\n"
+	resp, body = postMultipart(client, base+"/drill-files/panel-audit",
+		map[string]string{"template": auditTemplate, "panel": panel90})
+	a.Equal(http.StatusOK, resp.StatusCode, "rotated panel must return 200: %s", body)
+	var rotated map[string]any
+	_ = json.Unmarshal(body, &rotated)
+	rotLayouts, _ := rotated["layouts"].([]any)
+	a.Equal(1, len(rotLayouts), "body: %s", body)
+	if len(rotLayouts) == 1 {
+		layout := rotLayouts[0].(map[string]any)
+		a.EqualValues(90, layout["angle"], "body: %s", body)
+		instances, _ := layout["instances"].([]any)
+		a.Equal(1, len(instances), "body: %s", body)
+		if len(instances) == 1 {
+			inst := instances[0].(map[string]any)
+			a.Equal("10.000", inst["offset_x"], "body: %s", body)
+			a.Equal("10.000", inst["offset_y"], "body: %s", body)
+			a.Equal("9.000", inst["anchor_x"], "body: %s", body)
+			a.Equal("10.000", inst["anchor_y"], "body: %s", body)
+		}
+	}
+
+	// 20. Overlapping duplicate holes conserve counts: the template
+	//     drills (0,0) twice and (1,0) once; the panel holds two
+	//     overlapping copies at offsets (0,0) and (1,0), so (1,0)
+	//     appears 1+2 = 3 times.
+	dupTemplate := "M48\nMETRIC\nT01C0.500\n%\nT01\nX0Y0\nX0Y0\nX1Y0\nM30\n"
+	dupPanel := "M48\nMETRIC\nT01C0.500\n%\nT01\nX0Y0\nX0Y0\nX1Y0\nX1Y0\nX1Y0\nX2Y0\nM30\n"
+	resp, body = postMultipart(client, base+"/drill-files/panel-audit",
+		map[string]string{"template": dupTemplate, "panel": dupPanel})
+	a.Equal(http.StatusOK, resp.StatusCode, "overlapping duplicates must return 200: %s", body)
+	var overlap map[string]any
+	_ = json.Unmarshal(body, &overlap)
+	ovLayouts, _ := overlap["layouts"].([]any)
+	a.Equal(1, len(ovLayouts), "body: %s", body)
+	if len(ovLayouts) == 1 {
+		instances, _ := ovLayouts[0].(map[string]any)["instances"].([]any)
+		a.Equal(2, len(instances), "body: %s", body)
+		if len(instances) == 2 {
+			a.Equal("0.000", instances[0].(map[string]any)["offset_x"], "body: %s", body)
+			a.Equal("1.000", instances[1].(map[string]any)["offset_x"], "body: %s", body)
+		}
+	}
+
+	// 21. Extra hole: one clean instance at (10,5) plus an extra hole at
+	//     (99,99) on panel line 8. All four rotations fail with 422
+	//     PANEL_PATTERN_MISMATCH and per-angle evidence.
+	twoHoleTemplate := "M48\nMETRIC\nT01C0.500\n%\nT01\nX0Y0\nX2Y0\nM30\n"
+	extraPanel := "M48\nMETRIC\nT01C0.500\n%\nT01\nX10Y5\nX12Y5\nX99Y99\nM30\n"
+	resp, body = postMultipart(client, base+"/drill-files/panel-audit",
+		map[string]string{"template": twoHoleTemplate, "panel": extraPanel})
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "extra hole must return 422: %s", body)
+	var mismatch map[string]any
+	_ = json.Unmarshal(body, &mismatch)
+	a.Equal("PANEL_PATTERN_MISMATCH", mismatch["code"], "body: %s", body)
+	failures, _ := mismatch["failures"].([]any)
+	a.Equal(4, len(failures), "body: %s", body)
+	if len(failures) == 4 {
+		f0 := failures[0].(map[string]any)
+		a.EqualValues(0, f0["angle"], "body: %s", body)
+		a.EqualValues(8, f0["anchor_line"], "body: %s", body)
+		a.EqualValues(7, f0["missing_line"], "body: %s", body)
+		a.Equal("99.000", f0["offset_x"], "body: %s", body)
+		a.Equal("99.000", f0["offset_y"], "body: %s", body)
+	}
+
+	// 22. Missing hole: the panel holds only the first hole of the
+	//     instance at (10,5); again all four rotations fail.
+	missingPanel := "M48\nMETRIC\nT01C0.500\n%\nT01\nX10Y5\nM30\n"
+	resp, body = postMultipart(client, base+"/drill-files/panel-audit",
+		map[string]string{"template": twoHoleTemplate, "panel": missingPanel})
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "missing hole must return 422: %s", body)
+	var missing map[string]any
+	_ = json.Unmarshal(body, &missing)
+	a.Equal("PANEL_PATTERN_MISMATCH", missing["code"], "body: %s", body)
+	missFailures, _ := missing["failures"].([]any)
+	a.Equal(4, len(missFailures), "body: %s", body)
+	if len(missFailures) == 4 {
+		f0 := missFailures[0].(map[string]any)
+		a.EqualValues(0, f0["angle"], "body: %s", body)
+		a.EqualValues(6, f0["anchor_line"], "body: %s", body)
+		a.EqualValues(7, f0["missing_line"], "body: %s", body)
+	}
+
+	// 23. An invalid file keeps its original error code and line, tagged
+	//     with its part; the template is judged first.
+	resp, body = postMultipart(client, base+"/drill-files/panel-audit",
+		map[string]string{"template": "GARBAGE\n", "panel": "GARBAGE\n"})
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "invalid template must return 422: %s", body)
+	var badTemplate map[string]any
+	_ = json.Unmarshal(body, &badTemplate)
+	a.Equal("LINE_ORDER", badTemplate["code"], "body: %s", body)
+	a.EqualValues(1, badTemplate["line"], "body: %s", body)
+	a.Equal("template", badTemplate["part"], "body: %s", body)
+
+	resp, body = postMultipart(client, base+"/drill-files/panel-audit",
+		map[string]string{"template": twoHoleTemplate, "panel": "M48\nMETRIC\nT01C0.300\n%\nT02\nX1Y1\nM30\n"})
+	a.Equal(http.StatusUnprocessableEntity, resp.StatusCode, "invalid panel must return 422: %s", body)
+	var badPanel map[string]any
+	_ = json.Unmarshal(body, &badPanel)
+	a.Equal("UNDEFINED_TOOL", badPanel["code"], "body: %s", body)
+	a.EqualValues(5, badPanel["line"], "body: %s", body)
+	a.Equal("panel", badPanel["part"], "body: %s", body)
+
+	// 24. The panel audit only accepts multipart/form-data.
+	resp, body = post(client, base+"/drill-files/panel-audit", "text/plain", twoHoleTemplate)
+	a.Equal(http.StatusUnsupportedMediaType, resp.StatusCode, "text body must return 415: %s", body)
+
 	if t.failed {
 		os.Exit(1)
 	}
@@ -254,6 +396,36 @@ func waitForAPI(client *http.Client, url string) {
 
 func post(client *http.Client, url, contentType, bodyText string) (*http.Response, []byte) {
 	resp, err := client.Post(url, contentType, bytes.NewBufferString(bodyText))
+	if err != nil {
+		log.Fatalf("verify: request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp, raw
+}
+
+// postMultipart uploads the given parts as multipart/form-data. Parts
+// are written in template-then-panel order for reproducibility.
+func postMultipart(client *http.Client, url string, parts map[string]string) (*http.Response, []byte) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for _, name := range []string{"template", "panel"} {
+		content, ok := parts[name]
+		if !ok {
+			continue
+		}
+		fw, err := w.CreateFormFile(name, name+".drl")
+		if err != nil {
+			log.Fatalf("verify: multipart writer failed: %v", err)
+		}
+		if _, err := fw.Write([]byte(content)); err != nil {
+			log.Fatalf("verify: multipart writer failed: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		log.Fatalf("verify: multipart writer failed: %v", err)
+	}
+	resp, err := client.Post(url, w.FormDataContentType(), &buf)
 	if err != nil {
 		log.Fatalf("verify: request failed: %v", err)
 	}

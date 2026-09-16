@@ -35,6 +35,9 @@ const (
 	CodeNoHoles           = "NO_HOLES"
 	CodeHoleClearance     = "HOLE_CLEARANCE"
 	CodeAsymmetricPattern = "ASYMMETRIC_PATTERN"
+	// CodePanelPatternMismatch is returned only by the panel audit: no
+	// quarter-turn rotation of the template tiles the panel exactly.
+	CodePanelPatternMismatch = "PANEL_PATTERN_MISMATCH"
 )
 
 // ParseError identifies the first invalid line of a document.
@@ -84,6 +87,15 @@ type Report struct {
 	MaxY  string      `json:"max_y"`
 }
 
+// Hole is one validated drill record, kept for the panel audit: its
+// 1-based source line, the diameter of the selected tool and the exact
+// hole coordinates.
+type Hole struct {
+	Line     int
+	Diameter decimal.Decimal
+	X, Y     decimal.Decimal
+}
+
 type phase int
 
 const (
@@ -125,6 +137,30 @@ func ParseWithClearance(text string, minClearance *decimal.Decimal) (*Report, er
 // keeps its priority; an unmatchable pattern fails with
 // CodeAsymmetricPattern. A nil center disables the symmetry audit.
 func ParseWithAudits(text string, minClearance *decimal.Decimal, center *SymmetryCenter) (*Report, error) {
+	report, _, err := parseDocument(text, minClearance, center, false)
+	return report, err
+}
+
+// ParseHoles validates the complete document with the same rules and
+// error priorities as Parse and, only when every line is valid and at
+// least one hole exists, returns every drilled hole — source line, tool
+// diameter and exact coordinates — in body line order.
+func ParseHoles(text string) ([]Hole, error) {
+	_, holes, err := parseDocument(text, nil, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Hole, len(holes))
+	for i, h := range holes {
+		out[i] = Hole{Line: h.line, Diameter: h.diam, X: h.x, Y: h.y}
+	}
+	return out, nil
+}
+
+// parseDocument is the shared parse loop behind Parse, ParseWithAudits
+// and ParseHoles. When collectHoles is set, the validated holes are
+// returned along with the report.
+func parseDocument(text string, minClearance *decimal.Decimal, center *SymmetryCenter, collectHoles bool) (*Report, []placedHole, error) {
 	lines := splitLines(text)
 
 	diameters := make(map[string]decimal.Decimal)
@@ -133,10 +169,11 @@ func ParseWithAudits(text string, minClearance *decimal.Decimal, center *Symmetr
 	selected := ""
 	holeCount := 0
 	// Validated holes in body line order; only populated while at least
-	// one post-parse audit is active. The clearance audit reads radii,
-	// the symmetry audit reads tool and position.
+	// one post-parse audit is active or the caller collects them. The
+	// clearance audit reads radii, the symmetry audit reads tool and
+	// position, the panel audit reads diameters and position.
 	var holes []placedHole
-	auditsOn := minClearance != nil || center != nil
+	keepHoles := minClearance != nil || center != nil || collectHoles
 
 	ph := phaseHeader
 	var minX, minY, maxX, maxY decimal.Decimal
@@ -148,30 +185,30 @@ func ParseWithAudits(text string, minClearance *decimal.Decimal, center *Symmetr
 			switch {
 			case i == 0:
 				if line != "M48" {
-					return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
+					return nil, nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 				}
 			case i == 1:
 				if line != "METRIC" {
-					return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
+					return nil, nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 				}
 			case line == "%":
 				// The header requires one or more tool definitions.
 				if len(toolOrder) == 0 {
-					return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
+					return nil, nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 				}
 				ph = phaseBody
 			default:
 				tool, diam, ok := parseToolDef(line)
 				if !ok {
-					return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
+					return nil, nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 				}
 				// Structural shape matched: lexicon/range of the diameter
 				// wins over the duplicate-tool check.
 				if !isCanonicalNumber(diam, false, false) {
-					return nil, &ParseError{Line: lineNo, Code: CodeInvalidNumber}
+					return nil, nil, &ParseError{Line: lineNo, Code: CodeInvalidNumber}
 				}
 				if _, dup := diameters[tool]; dup {
-					return nil, &ParseError{Line: lineNo, Code: CodeDuplicateTool}
+					return nil, nil, &ParseError{Line: lineNo, Code: CodeDuplicateTool}
 				}
 				d, _ := decimal.NewFromString(diam)
 				diameters[tool] = d
@@ -183,22 +220,22 @@ func ParseWithAudits(text string, minClearance *decimal.Decimal, center *Symmetr
 		// Body.
 		if line == "M30" {
 			if lineNo != len(lines) {
-				return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
+				return nil, nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 			}
 			if holeCount == 0 {
-				return nil, &ParseError{Line: lineNo, Code: CodeNoHoles}
+				return nil, nil, &ParseError{Line: lineNo, Code: CodeNoHoles}
 			}
 			if center != nil {
 				if uncovered := asymmetricLines(holes, *center); len(uncovered) > 0 {
-					return nil, &ParseError{Line: uncovered[0], Code: CodeAsymmetricPattern, UncoveredLines: uncovered}
+					return nil, nil, &ParseError{Line: uncovered[0], Code: CodeAsymmetricPattern, UncoveredLines: uncovered}
 				}
 			}
-			return buildReport(toolOrder, counts, holeCount, minX, minY, maxX, maxY), nil
+			return buildReport(toolOrder, counts, holeCount, minX, minY, maxX, maxY), holes, nil
 		}
 
 		if tool, ok := parseToolSelect(line); ok {
 			if _, defined := diameters[tool]; !defined {
-				return nil, &ParseError{Line: lineNo, Code: CodeUndefinedTool}
+				return nil, nil, &ParseError{Line: lineNo, Code: CodeUndefinedTool}
 			}
 			selected = tool
 			continue
@@ -206,19 +243,19 @@ func ParseWithAudits(text string, minClearance *decimal.Decimal, center *Symmetr
 
 		xs, ys, ok := parseHole(line)
 		if !ok {
-			return nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
+			return nil, nil, &ParseError{Line: lineNo, Code: CodeLineOrder}
 		}
 		// Both numbers share one lexicon check; the X axis is read first.
 		if !isCanonicalNumber(xs, true, true) || !isCanonicalNumber(ys, true, true) {
-			return nil, &ParseError{Line: lineNo, Code: CodeInvalidNumber}
+			return nil, nil, &ParseError{Line: lineNo, Code: CodeInvalidNumber}
 		}
 		if selected == "" {
-			return nil, &ParseError{Line: lineNo, Code: CodeUndefinedTool}
+			return nil, nil, &ParseError{Line: lineNo, Code: CodeUndefinedTool}
 		}
 		x, _ := decimal.NewFromString(xs)
 		y, _ := decimal.NewFromString(ys)
-		if auditsOn {
-			h := placedHole{line: lineNo, tool: selected, x: x, y: y}
+		if keepHoles {
+			h := placedHole{line: lineNo, tool: selected, x: x, y: y, diam: diameters[selected]}
 			if minClearance != nil {
 				h.radius = diameters[selected].Div(two)
 				for _, prev := range holes {
@@ -231,7 +268,7 @@ func ParseWithAudits(text string, minClearance *decimal.Decimal, center *Symmetr
 					dx := x.Sub(prev.x)
 					dy := y.Sub(prev.y)
 					if dx.Mul(dx).Add(dy.Mul(dy)).Cmp(need.Mul(need)) < 0 {
-						return nil, &ParseError{Line: lineNo, Code: CodeHoleClearance, ConflictLine: prev.line}
+						return nil, nil, &ParseError{Line: lineNo, Code: CodeHoleClearance, ConflictLine: prev.line}
 					}
 				}
 			}
@@ -258,17 +295,19 @@ func ParseWithAudits(text string, minClearance *decimal.Decimal, center *Symmetr
 	}
 
 	// Ran out of lines before reaching M30 (includes an empty document).
-	return nil, &ParseError{Line: len(lines) + 1, Code: CodeLineOrder}
+	return nil, nil, &ParseError{Line: len(lines) + 1, Code: CodeLineOrder}
 }
 
 // placedHole is a validated hole kept, in body line order, for the
-// post-parse audits. radius is only populated while the clearance audit
-// is active.
+// post-parse audits and the panel matcher. radius is only populated
+// while the clearance audit is active; diam is populated whenever the
+// holes are kept.
 type placedHole struct {
 	line   int
 	tool   string
 	x, y   decimal.Decimal
 	radius decimal.Decimal
+	diam   decimal.Decimal
 }
 
 // asymKey identifies one class of hole: the selected tool and the exact

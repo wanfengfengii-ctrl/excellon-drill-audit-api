@@ -1,7 +1,9 @@
 package api_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -350,4 +352,216 @@ func TestStatistics_NoSymmetryParamKeepsBehavior(t *testing.T) {
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(raw, &got))
 	assert.EqualValues(t, 1, got["total_holes"])
+}
+
+// ---- POST /drill-files/panel-audit ----
+
+// auditTemplate is the asymmetric L-shaped template: holes (0,0),
+// (2,0), (0,1) on lines 6-8.
+const auditTemplate = "M48\nMETRIC\nT01C0.500\n%\nT01\nX0Y0\nX2Y0\nX0Y1\nM30\n"
+
+// auditTwoHoleTemplate drills (0,0) and (2,0) on lines 6-7.
+const auditTwoHoleTemplate = "M48\nMETRIC\nT01C0.500\n%\nT01\nX0Y0\nX2Y0\nM30\n"
+
+// postPanelAudit uploads the given parts as multipart/form-data. Parts
+// are written in template-then-panel order for reproducibility.
+func postPanelAudit(t *testing.T, r http.Handler, parts map[string]string) (*httptest.ResponseRecorder, []byte) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for _, name := range []string{"template", "panel"} {
+		content, ok := parts[name]
+		if !ok {
+			continue
+		}
+		fw, err := w.CreateFormFile(name, name+".drl")
+		require.NoError(t, err)
+		_, err = fw.Write([]byte(content))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+
+	req := httptest.NewRequest(http.MethodPost, "/drill-files/panel-audit", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec, rec.Body.Bytes()
+}
+
+func TestPanelAudit_MultiInstanceSuccess(t *testing.T) {
+	// Three copies of the L template at offsets (10,5), (20,3), (30,8).
+	panel := "M48\nMETRIC\nT01C0.500\n%\nT01\n" +
+		"X10Y5\nX12Y5\nX10Y6\n" +
+		"X20Y3\nX22Y3\nX20Y4\n" +
+		"X30Y8\nX32Y8\nX30Y9\n" +
+		"M30\n"
+	w, raw := postPanelAudit(t, api.Router(), map[string]string{"template": auditTemplate, "panel": panel})
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	layouts := got["layouts"].([]any)
+	require.Len(t, layouts, 1)
+	layout := layouts[0].(map[string]any)
+	assert.EqualValues(t, 0, layout["angle"])
+	instances := layout["instances"].([]any)
+	require.Len(t, instances, 3)
+	// Instances are sorted by anchor coordinates.
+	wantOffsets := [][2]string{{"10.000", "5.000"}, {"20.000", "3.000"}, {"30.000", "8.000"}}
+	for i, inst := range instances {
+		m := inst.(map[string]any)
+		assert.Equal(t, wantOffsets[i][0], m["offset_x"], "instance %d", i)
+		assert.Equal(t, wantOffsets[i][1], m["offset_y"], "instance %d", i)
+		assert.Equal(t, wantOffsets[i][0], m["anchor_x"], "instance %d", i)
+		assert.Equal(t, wantOffsets[i][1], m["anchor_y"], "instance %d", i)
+	}
+}
+
+func TestPanelAudit_RotationRecognized(t *testing.T) {
+	// The panel is the template rotated 90 degrees counterclockwise and
+	// translated by (10,10): holes (10,10), (10,12), (9,10).
+	panel := "M48\nMETRIC\nT01C0.500\n%\nT01\nX10Y10\nX10Y12\nX9Y10\nM30\n"
+	w, raw := postPanelAudit(t, api.Router(), map[string]string{"template": auditTemplate, "panel": panel})
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	layouts := got["layouts"].([]any)
+	require.Len(t, layouts, 1)
+	layout := layouts[0].(map[string]any)
+	assert.EqualValues(t, 90, layout["angle"])
+	instances := layout["instances"].([]any)
+	require.Len(t, instances, 1)
+	inst := instances[0].(map[string]any)
+	assert.Equal(t, "10.000", inst["offset_x"])
+	assert.Equal(t, "10.000", inst["offset_y"])
+	assert.Equal(t, "9.000", inst["anchor_x"])
+	assert.Equal(t, "10.000", inst["anchor_y"])
+}
+
+func TestPanelAudit_OverlappingDuplicatesConserveCounts(t *testing.T) {
+	// Template drills (0,0) twice and (1,0) once; the panel holds two
+	// overlapping copies at offsets (0,0) and (1,0), so (1,0) appears
+	// 1+2 = 3 times.
+	template := "M48\nMETRIC\nT01C0.500\n%\nT01\nX0Y0\nX0Y0\nX1Y0\nM30\n"
+	panel := "M48\nMETRIC\nT01C0.500\n%\nT01\nX0Y0\nX0Y0\nX1Y0\nX1Y0\nX1Y0\nX2Y0\nM30\n"
+	w, raw := postPanelAudit(t, api.Router(), map[string]string{"template": template, "panel": panel})
+	require.Equal(t, http.StatusOK, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	layouts := got["layouts"].([]any)
+	require.Len(t, layouts, 1)
+	instances := layouts[0].(map[string]any)["instances"].([]any)
+	require.Len(t, instances, 2)
+	assert.Equal(t, "0.000", instances[0].(map[string]any)["offset_x"])
+	assert.Equal(t, "1.000", instances[1].(map[string]any)["offset_x"])
+}
+
+func TestPanelAudit_ExtraHoleFailsWithFourOrientations(t *testing.T) {
+	// One clean instance at (10,5) plus an extra hole at (99,99) on
+	// panel line 8: all four rotations fail and each failure record
+	// carries its evidence.
+	panel := "M48\nMETRIC\nT01C0.500\n%\nT01\nX10Y5\nX12Y5\nX99Y99\nM30\n"
+	w, raw := postPanelAudit(t, api.Router(), map[string]string{"template": auditTwoHoleTemplate, "panel": panel})
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "PANEL_PATTERN_MISMATCH", got["code"])
+	assert.NotContains(t, string(raw), "layouts")
+	failures := got["failures"].([]any)
+	require.Len(t, failures, 4)
+
+	f0 := failures[0].(map[string]any)
+	assert.EqualValues(t, 0, f0["angle"])
+	assert.EqualValues(t, 8, f0["anchor_line"])
+	assert.EqualValues(t, 7, f0["missing_line"])
+	assert.Equal(t, "99.000", f0["offset_x"])
+	assert.Equal(t, "99.000", f0["offset_y"])
+
+	// The 180-degree rotation consumes the clean instance first and
+	// then fails on the extra hole with its own offset.
+	f2 := failures[2].(map[string]any)
+	assert.EqualValues(t, 180, f2["angle"])
+	assert.EqualValues(t, 8, f2["anchor_line"])
+	assert.EqualValues(t, 6, f2["missing_line"])
+	assert.Equal(t, "101.000", f2["offset_x"])
+	assert.Equal(t, "99.000", f2["offset_y"])
+}
+
+func TestPanelAudit_MissingHoleFailsWithFourOrientations(t *testing.T) {
+	// The panel holds only the first hole of the instance at (10,5).
+	panel := "M48\nMETRIC\nT01C0.500\n%\nT01\nX10Y5\nM30\n"
+	w, raw := postPanelAudit(t, api.Router(), map[string]string{"template": auditTwoHoleTemplate, "panel": panel})
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "PANEL_PATTERN_MISMATCH", got["code"])
+	failures := got["failures"].([]any)
+	require.Len(t, failures, 4)
+	for i, f := range failures {
+		m := f.(map[string]any)
+		assert.EqualValues(t, []int{0, 90, 180, 270}[i], m["angle"])
+		assert.EqualValues(t, 6, m["anchor_line"])
+	}
+	assert.EqualValues(t, 7, failures[0].(map[string]any)["missing_line"])
+}
+
+func TestPanelAudit_InvalidTemplateJudgedFirst(t *testing.T) {
+	// Both files are invalid; the template error wins.
+	w, raw := postPanelAudit(t, api.Router(), map[string]string{
+		"template": "GARBAGE\n",
+		"panel":    "M48\nMETRIC\nT01C0.300\n%\nT02\nX1Y1\nM30\n",
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "LINE_ORDER", got["code"])
+	assert.EqualValues(t, 1, got["line"])
+	assert.Equal(t, "template", got["part"])
+}
+
+func TestPanelAudit_InvalidPanelReportsPart(t *testing.T) {
+	// The template is valid; the panel references undefined tool T02
+	// on its line 5.
+	w, raw := postPanelAudit(t, api.Router(), map[string]string{
+		"template": auditTemplate,
+		"panel":    "M48\nMETRIC\nT01C0.300\n%\nT02\nX1Y1\nM30\n",
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, string(raw))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "UNDEFINED_TOOL", got["code"])
+	assert.EqualValues(t, 5, got["line"])
+	assert.Equal(t, "panel", got["part"])
+}
+
+func TestPanelAudit_UnsupportedMediaType(t *testing.T) {
+	// The panel audit only accepts multipart/form-data.
+	req := httptest.NewRequest(http.MethodPost, "/drill-files/panel-audit", strings.NewReader("x"))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusUnsupportedMediaType, rec.Code)
+}
+
+func TestPanelAudit_MissingPart(t *testing.T) {
+	// No parts at all: the template is reported missing first.
+	w, raw := postPanelAudit(t, api.Router(), map[string]string{})
+	require.Equal(t, http.StatusBadRequest, w.Code, string(raw))
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "MISSING_PART", got["code"])
+	assert.Equal(t, "template", got["part"])
+
+	// Only the template: the panel is missing.
+	w, raw = postPanelAudit(t, api.Router(), map[string]string{"template": auditTemplate})
+	require.Equal(t, http.StatusBadRequest, w.Code, string(raw))
+	require.NoError(t, json.Unmarshal(raw, &got))
+	assert.Equal(t, "MISSING_PART", got["code"])
+	assert.Equal(t, "panel", got["part"])
 }

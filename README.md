@@ -19,7 +19,7 @@
 │   ├── verify/        # 一次性端到端冒烟检查（Compose 的 verify 服务）
 │   └── healthcheck/   # 容器健康检查小程序（distroless 内无 shell/curl）
 ├── internal/
-│   ├── excellon/      # 词法/结构校验与统计（核心逻辑，含完整单测）
+│   ├── excellon/      # 词法/结构校验、统计与拼板步进重复核对（核心逻辑，含完整单测）
 │   └── api/           # Gin 路由与 HTTP 适配（含单测）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -106,6 +106,69 @@
 始终先于对称审计；`symmetry_center` 参数本身的重复或非法值返回 `400 INVALID_SYMMETRY`
 （客户端错误），在读取正文之前拒绝，不会被当作文件错误。
 
+### `POST /drill-files/panel-audit`
+
+核对步进重复（step-and-repeat）生成的拼板是否完整：上传**模板**（单个拼板单元的钻孔程序）与
+**拼板**（整板钻孔程序）两份受限 Excellon 文件，服务依次按 0°、90°、180°、270°（逆时针）旋转
+模板，检验拼板是否恰好由同一方向的若干模板实例平铺而成。
+
+- 请求：`Content-Type: multipart/form-data`，两个文件字段 **`template`** 与 **`panel`**（缺任一个
+  返回 `400 MISSING_PART` 并指明 `part`）；每个部分上限 10 MiB，超出返回 `413`
+- 两份文件复用与统计入口完全相同的校验；**先判 template 再判 panel**。任一文件非法时返回
+  `422`，错误体在原错误码与行号之外携带 **`part`**（`"template"` 或 `"panel"`）指明出错文件
+- 匹配规则（每个旋转方向独立、确定性执行）：
+  1. 取旋转后模板中按（直径、X、Y）数值序最小的孔为**锚**；
+  2. 反复从**剩余拼板孔**的同序最小项推导偏移量（拼板最小孔 − 模板锚），再按模板行序把整份
+     模板从“（直径、变换坐标）多重集”中逐孔扣减；
+  3. 多重集只按**直径与坐标**计数：重复孔、同直径异刀号的孔、实例间重叠都按份数守恒处理；
+  4. 某方向扣减失败（拼板孔多余或缺失）时记录证据：锚点**拼板行**、首个缺失**模板行**与
+     当前偏移量；拼板被恰好耗尽时该方向成功
+- 成功：`200 OK`，按角度列出**全部**可行布局；每个布局给出所有实例的偏移量与锚点坐标，
+  实例按锚点坐标排序
+- 四个方向全部失败：`422 PANEL_PATTERN_MISMATCH`，`failures` 按角度顺序携带四条失败证据
+- 非 `multipart/form-data`：`415 Unsupported Media Type`
+
+成功响应示例：
+
+```json
+{
+  "layouts": [
+    {
+      "angle": 0,
+      "instances": [
+        { "offset_x": "10.000", "offset_y": "5.000", "anchor_x": "10.000", "anchor_y": "5.000" },
+        { "offset_x": "20.000", "offset_y": "3.000", "anchor_x": "20.000", "anchor_y": "3.000" }
+      ]
+    }
+  ]
+}
+```
+
+失败响应示例（拼板多一个孔，四个方向均无法恰好耗尽）：
+
+```json
+{
+  "code": "PANEL_PATTERN_MISMATCH",
+  "failures": [
+    { "angle": 0, "anchor_line": 8, "missing_line": 7, "offset_x": "99.000", "offset_y": "99.000" },
+    { "angle": 90, "anchor_line": 6, "missing_line": 7, "offset_x": "10.000", "offset_y": "5.000" },
+    { "angle": 180, "anchor_line": 8, "missing_line": 6, "offset_x": "101.000", "offset_y": "99.000" },
+    { "angle": 270, "anchor_line": 6, "missing_line": 6, "offset_x": "10.000", "offset_y": "7.000" }
+  ]
+}
+```
+
+文件非法的错误体示例（拼板文件第 5 行选择了未定义刀具）：
+
+```json
+{ "code": "UNDEFINED_TOOL", "line": 5, "part": "panel" }
+```
+
+| code | 含义 |
+|---|---|
+| `MISSING_PART` | 缺少 `template` 或 `panel` 文件字段（400），`part` 指明缺失字段 |
+| `PANEL_PATTERN_MISMATCH` | 四个旋转方向都无法把拼板恰好耗尽；`failures` 逐角度给出锚点拼板行、首个缺失模板行与偏移量 |
+
 ### `GET /healthz`
 
 存活探针，固定返回 `200 ok`。
@@ -185,7 +248,9 @@ docker compose logs verify          # 查看一次性检查结果（通过后退
 - `api` 服务：常驻，内置容器健康检查（自带 `/healthcheck` 探针，适配 distroless）
 - `verify` 服务：等待 `api` 健康后启动，跑一组成功/失败用例（成功体、三类 422、
   最早错误、415、`min_clearance` 合法/相切/冲突/非法参数，以及 `symmetry_center`
-  精确对称成功、数量失衡、自映射、非法/重复参数、审计优先级等），输出
+  精确对称成功、数量失衡、自映射、非法/重复参数、审计优先级，拼板审计的多实例成功、
+  旋转识别、重叠重复孔守恒、多余/缺失孔的四方向失败证据、文件错误的 `part` 归属与
+  媒体类型拒绝等），输出
   `verify: all checks passed` 后退出；任一断言失败则退出码非 0
 
 镜像只由 `api` 服务声明一次构建；`verify` 复用同一个本地镜像（换用 `/verify`
